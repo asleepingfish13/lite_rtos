@@ -1,0 +1,284 @@
+/**
+ * @file    port.c
+ * @brief   Lite RTOS - 平台移植层实现 (跨平台)
+ *
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │  平台         │  上下文切换    │  系统节拍                  │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │  Unix         │  ucontext      │  setitimer + SIGALRM       │
+ * │  (macOS/Linux)│  swapcontext() │  信号处理函数设置标志位     │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │  Windows      │  Fibers API    │  后台线程 + Sleep(10ms)    │
+ * │  (MSYS2)      │  SwitchToFiber│  线程设置标志位             │
+ * └─────────────────────────────────────────────────────────────┘
+ *
+ * 设计原理 (两个平台统一):
+ *   上下文切换 = 保存当前"执行现场" → 切换到另一个任务的"执行现场"
+ *   系统节拍   = 定时器 → 设置 tick_pending 标志 → schedule() 处理
+ *   临界区     = 保护内核数据结构不被"中断"破坏
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef _WIN32
+    /* Windows: Fibers + 后台线程 */
+    #include <windows.h>
+    #include <process.h>
+#else
+    /* Unix: ucontext + 信号 */
+    #include <signal.h>
+    #include <sys/time.h>
+    #include <unistd.h>
+#endif
+
+#include "port.h"
+#include "task.h"
+
+/* 外部声明 (kernel.c) */
+extern void     schedule(void);
+extern uint32_t tick_count;
+extern tcb_t   *current_task;
+
+/* ====================================================================
+ *  系统节拍常量
+ * ==================================================================== */
+#define TICK_RATE_HZ     100
+#define TICK_INTERVAL_MS (1000 / TICK_RATE_HZ)   /* 10ms */
+
+/* ====================================================================
+ *  信号安全标志 (跨平台共用)
+ * ==================================================================== */
+static volatile int tick_pending = 0;
+
+/* ====================================================================
+ *  Windows 实现: Fibers API + 后台 tick 线程
+ * ==================================================================== */
+#ifdef _WIN32
+
+/* -------------------------------------------------------------------
+ *  Windows 上下文切换 (Fibers API)
+ *
+ *  Fiber 是 Windows 的用户态协程:
+ *    ConvertThreadToFiber() — 把当前线程转成 fiber
+ *    CreateFiber()          — 创建一个新 fiber (指定栈大小和入口函数)
+ *    SwitchToFiber()        — 切换到目标 fiber (隐式保存当前 fiber 状态)
+ *    DeleteFiber()          — 销毁 fiber
+ *
+ *  与 ucontext 的对应关系:
+ *    makecontext()  ≈ CreateFiber()
+ *    swapcontext()  ≈ SwitchToFiber()
+ *    setcontext()   ≈ SwitchToFiber() (从 ConvertThreadToFiber 的结果)
+ * ------------------------------------------------------------------- */
+
+void port_init_task_context(tcb_t *task, void (*task_func)(void))
+{
+    task->fiber = CreateFiber(task->stack_size,
+                               (LPFIBER_START_ROUTINE)task_func,
+                               NULL);
+    if (task->fiber == NULL) {
+        fprintf(stderr, "[port] CreateFiber failed: error %lu\n", GetLastError());
+        exit(1);
+    }
+}
+
+void port_start_first_task(tcb_t *task)
+{
+    printf("[port] Starting first task: '%s'\n", task->name);
+    /* 把当前线程 (main) 转成 fiber, 这是使用其他 fiber 的前提 */
+    ConvertThreadToFiber(NULL);
+    /* 跳转到第一个任务, 不保存当前 fiber (一去不回) */
+    SwitchToFiber(task->fiber);
+    /* 不会执行到这里 */
+    perror("SwitchToFiber");
+    exit(1);
+}
+
+void port_switch_context(tcb_t *from, tcb_t *to)
+{
+    (void)from;  /* from 的状态由 SwitchToFiber 隐式保存 */
+    SwitchToFiber(to->fiber);
+    /* 当 from 再次被调度时, 从这里继续执行 */
+}
+
+/* -------------------------------------------------------------------
+ *  Windows 系统节拍 (后台线程)
+ *
+ *  创建一个独立的线程, 每 10ms 设置 tick_pending 标志。
+ *  与 Unix 信号处理函数的作用完全等价。
+ *
+ *  注意: 这里不需要处理"抢占"。tick 线程只设置标志,
+ *        实际的延时任务处理 + 调度在 schedule() 中完成。
+ * ------------------------------------------------------------------- */
+static HANDLE tick_thread_handle = NULL;
+static volatile int tick_thread_running = 1;
+
+static DWORD WINAPI tick_thread_func(LPVOID param)
+{
+    (void)param;
+    while (tick_thread_running) {
+        Sleep(TICK_INTERVAL_MS);   /* 10ms (100Hz tick rate) */
+        tick_pending = 1;
+    }
+    return 0;
+}
+
+void port_init_tick_timer(void)
+{
+    tick_thread_handle = CreateThread(
+        NULL,                /* 默认安全属性 */
+        0,                   /* 默认栈大小 */
+        tick_thread_func,    /* 线程函数 */
+        NULL,                /* 参数 */
+        0,                   /* 创建标志 */
+        NULL                 /* 线程 ID (不需要) */
+    );
+
+    if (tick_thread_handle == NULL) {
+        fprintf(stderr, "[port] CreateThread failed: error %lu\n", GetLastError());
+        exit(1);
+    }
+
+    printf("[port] Tick thread started: %d Hz (%d ms/tick)\n",
+           TICK_RATE_HZ, TICK_INTERVAL_MS);
+}
+
+/* -------------------------------------------------------------------
+ *  Windows 临界区
+ *
+ *  Windows 上没有"中断"的概念。tick 线程和主线程之间通过
+ *  tick_pending 标志通信, 该标志的读写是原子的 (int 在 x86/ARM 上)。
+ *  链表操作只在主线程 (schedule) 中进行, 无需额外保护。
+ *
+ *  为了 API 兼容性, 提供空实现。
+ * ------------------------------------------------------------------- */
+void port_disable_interrupts(void) { /* Windows: no-op */ }
+void port_enable_interrupts(void)  { /* Windows: no-op */ }
+
+/* ====================================================================
+ *  Unix 实现 (macOS / Linux)
+ * ==================================================================== */
+#else
+
+/* -------------------------------------------------------------------
+ *  Unix 上下文切换 (ucontext)
+ * ------------------------------------------------------------------- */
+
+void port_init_task_context(tcb_t *task, void (*task_func)(void))
+{
+    if (getcontext(&task->context) == -1) {
+        perror("getcontext");
+        exit(1);
+    }
+
+    task->context.uc_stack.ss_sp    = task->stack;
+    task->context.uc_stack.ss_size  = task->stack_size;
+    task->context.uc_stack.ss_flags = 0;
+    task->context.uc_link = NULL;
+
+    makecontext(&task->context, (void (*)(void))task_func, 0);
+}
+
+void port_start_first_task(tcb_t *task)
+{
+    printf("[port] Starting first task: '%s'\n", task->name);
+    setcontext(&task->context);
+    perror("setcontext");
+    exit(1);
+}
+
+void port_switch_context(tcb_t *from, tcb_t *to)
+{
+    if (swapcontext(&from->context, &to->context) == -1) {
+        perror("swapcontext");
+        exit(1);
+    }
+}
+
+/* -------------------------------------------------------------------
+ *  Unix 系统节拍 (setitimer + SIGALRM)
+ *
+ *  SIGALRM 处理函数在信号上下文中运行, 遵守信号安全规则:
+ *    ✓ sig_atomic_t 读写
+ *    ✗ 不调用 printf/malloc/list_* 等
+ *
+ *  只设置 tick_pending 标志, 实际处理在 schedule() 中完成。
+ * ------------------------------------------------------------------- */
+
+static void tick_signal_handler(int sig)
+{
+    (void)sig;
+    tick_pending = 1;
+}
+
+void port_init_tick_timer(void)
+{
+    struct sigaction sa;
+    struct itimerval timer;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = tick_signal_handler;
+    sa.sa_flags   = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+
+    if (sigaction(SIGALRM, &sa, NULL) == -1) {
+        perror("sigaction");
+        exit(1);
+    }
+
+    timer.it_value.tv_sec     = 0;
+    timer.it_value.tv_usec    = TICK_INTERVAL_MS * 1000;
+    timer.it_interval.tv_sec  = 0;
+    timer.it_interval.tv_usec = TICK_INTERVAL_MS * 1000;
+
+    if (setitimer(ITIMER_REAL, &timer, NULL) == -1) {
+        perror("setitimer");
+        exit(1);
+    }
+
+    printf("[port] Tick timer started: %d Hz (%d ms/tick)\n",
+           TICK_RATE_HZ, TICK_INTERVAL_MS);
+}
+
+/* -------------------------------------------------------------------
+ *  Unix 临界区 (阻塞/解除 SIGALRM)
+ *
+ *  在修改就绪链表、延时链表等全局数据结构时,
+ *  阻塞 SIGALRM 防止信号处理函数中断操作导致数据损坏。
+ * ------------------------------------------------------------------- */
+
+static sigset_t block_mask;
+static int interrupts_disabled = 0;
+
+void port_disable_interrupts(void)
+{
+    if (interrupts_disabled) return;
+    interrupts_disabled = 1;
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGALRM);
+    sigprocmask(SIG_BLOCK, &block_mask, NULL);
+}
+
+void port_enable_interrupts(void)
+{
+    if (!interrupts_disabled) return;
+    interrupts_disabled = 0;
+    sigprocmask(SIG_UNBLOCK, &block_mask, NULL);
+}
+
+#endif /* _WIN32 */
+
+/* ====================================================================
+ *  跨平台共用 API
+ * ==================================================================== */
+
+/* 空闲等待: 模拟 WFI (Wait For Interrupt), 避免 100% CPU 占用 */
+#ifdef _WIN32
+void port_idle_wait(void) { Sleep(1); }       /* Windows: 1ms */
+#else
+void port_idle_wait(void) { usleep(1000); }   /* Unix: 1000μs = 1ms */
+#endif
+
+int  port_tick_pending(void) { return tick_pending; }
+void port_clear_tick(void)   { tick_pending = 0; }
