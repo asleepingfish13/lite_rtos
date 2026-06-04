@@ -249,6 +249,45 @@ void list_remove(list_node_t *node) {
 
 侵入式链表的精髓：**链表不拥有数据，数据拥有链表节点**。删除时不需要遍历，也不需要知道属于哪个链表——只需要节点的 `prev` 和 `next` 指针。
 
+**深入理解：两种链表的内存布局**
+
+```
+普通链表 — 数据"拥有"节点指针：
+  malloc 出来的整块数据               malloc 出来的整块数据
+  ┌─────────────────────┐             ┌─────────────────────┐
+  │ data=42             │   next      │ data=99             │
+  │ next ───────────────┼────────────→│ next = NULL         │
+  └─────────────────────┘             └─────────────────────┘
+  next 指向的是"下一个数据块的起始地址"。数据块和链表指针是同一次 malloc 的。
+
+侵入式链表 — 节点"嵌入"数据结构：
+  每个 TCB 在内存中是静态的（创立后就放在那不动），链表只串起每个 TCB 里的 node 成员：
+
+  TCB_A 起始地址                           TCB_B 起始地址
+  ┌──────────────────────┐                ┌──────────────────────┐
+  │ name | priority | ... │                │ name | priority | ... │
+  │ node.next ───────────┼──→ ... ──→     │ node.next ────────────┼──→ sentinel
+  │ node.prev ←──────────┼── ... ←──     │ node.prev ←───────────┼── ...
+  └──────────────────────┘                └──────────────────────┘
+
+  链表串起来的不是整个 TCB，而是每个 TCB 里那个小小的 node 成员。
+```
+
+**调度器在做什么？只是在改指针：**
+
+所有 TCB 在内存里创建后就放在那不动。调度器的全部工作就是改 `node.prev` 和 `node.next` 指针，重新排列串联顺序：
+
+```
+就绪链表:   sentinel → [TCB_A.node] → [TCB_C.node] → sentinel
+延时链表:   sentinel → [TCB_B.node] → sentinel
+
+当 Task B 的 tick 到期：
+  1. list_remove(&TCB_B.node)     — 把 B 的 node 从延时链表摘下来（改 4 个指针）
+  2. task_add_to_ready(&TCB_B)    — 把 B 的 node 挂到就绪链表尾部（又改 4 个指针）
+
+TCB_B 这块内存从头到尾没动过。纯粹是逻辑上的重新排队。
+```
+
 **哨兵节点 (Sentinel)**：
 
 ```
@@ -270,6 +309,27 @@ void list_remove(list_node_t *node) {
 
 哨兵节点的作用是消除边界条件。插入第一个节点和插入第 N 个节点的代码完全相同——不需要 `if (list->head == NULL)` 这样的特殊判断。
 
+**问：链表是循环的，遍历到 sentinel 不就死循环了吗？**
+
+确实是个圈，但遍历时有明确的终止条件：
+
+```c
+// 遍历就绪链表 — 遇到 sentinel 就停
+// 宏展开后: for (n = sentinel.next;  n != &sentinel;  n = n->next)
+list_for_each(n, &ready_lists[prio]) {
+    tcb_t *task = list_entry(n, tcb_t, node);
+    // 处理 task...
+}
+```
+
+流程是：`sentinel → NodeA → NodeB → sentinel（看到你了，停，不进去）`
+
+sentinel 同时扮演两个角色：
+- **起点**：`sentinel.next` 就是第一个数据节点
+- **终点标志**：遍历到 `&sentinel` 时退出循环，不进它的 next
+
+圈是真的圈，只是走路时看到哨兵就停。
+
 **关键宏：从节点反查容器**
 
 ```c
@@ -283,6 +343,35 @@ tcb_t *task = list_entry(node, tcb_t, node);
 ```
 
 这利用了一个简单的事实：如果知道 `node` 成员在 `tcb_t` 中的偏移量，用 `node` 的地址减去偏移量，就得到了 `tcb_t` 的地址。
+
+**container_of 逐层拆解：**
+
+```c
+#define container_of(ptr, type, member) \
+    ((type *)((char *)(ptr) - offsetof(type, member)))
+```
+
+| 步骤 | 代码 | 作用 |
+|------|------|------|
+| 1 | `offsetof(type, member)` | 编译器内建宏，算出 member 在 type 里的字节偏移量。比如 `offsetof(tcb_t, node)` = 40 |
+| 2 | `(char *)(ptr)` | 把指针强转成 `char*`，这样加减运算的单位是**字节**（否则 `ptr - 40` 会以为是减 40 个 `tcb_t`，实际会减 `40 × sizeof(tcb_t)` 字节） |
+| 3 | `(char *)(ptr) - offset` | 用 node 地址减去偏移量，得到 tcb 的起始地址 |
+| 4 | `(type *)...` | 把得到的地址强转回 `tcb_t*` 类型 |
+
+图示：
+
+```
+  tcb_t 起始地址 (0x100000)              node 成员地址 (0x100040)
+  ├──────────────────────────────────────────┤
+  │ name[16] │ priority │ ... │ node.next/prev │
+  └──────────────────────────────────────────┘
+              offsetof(tcb_t, node) = 40 字节
+              ├──────────────────────────────→|
+
+  tcb 起始地址 = node地址(0x100040) - 偏移(40) = 0x100000 ✓
+```
+
+为什么要 `(char *)`？因为 C 的指针减法是按类型大小算的。`int *p = 0x100040; p - 40;` 会减掉 `40 × sizeof(int) = 160` 字节，不是 40 字节。转成 `char *`（大小为 1 字节）才能精确做字节减法。
 
 ### 3.3 学习检查点
 
@@ -365,6 +454,30 @@ tcb_t *task_create(task_func, name, stack_size, priority) {
 }
 ```
 
+**为什么是这 4 步，顺序能换吗？**
+
+每一步都有必须的理由，而且顺序严格不可颠倒：
+
+| 步骤 | 做什么 | 为什么必须这一步 | 为什么必须这个顺序 |
+|------|--------|-----------------|-------------------|
+| ① 分配 TCB | `malloc(sizeof(tcb_t))` | 内核需要一个地方保存任务的所有元数据（优先级、状态、延时计数、链表节点）。没有 TCB，调度器没有任何东西可以管理。`memset` 清零防止未初始化字段（如 `delay_ticks`）有垃圾值 | 必须先有 TCB，才能往里面填信息 |
+| ② 分配独立栈 | `malloc(stack_size)` | 每个任务必须有独立的调用栈，否则任务 B 运行时会覆盖任务 A 的栈帧，切回 A 时数据就烂了 | 必须在 ucontext 初始化之前，因为下一步需要把栈地址写入 context |
+| ③ init ucontext | `port_init_task_context()` | 回答两个关键问题：这个任务从哪开始跑？（设置 RIP → 入口函数）用哪个栈？（设置 RSP → 独立栈）| 栈地址在手上才能设置 context |
+| ④ 加入就绪链表 | `task_add_to_ready()` | 让任务对调度器"可见"。在此之前任务虽然准备好了，但不在 `ready_lists[]` 里，`find_highest_priority_task()` 扫链表时根本看不到 | 必须在所有信息就绪之后才能暴露给调度器 |
+
+**为什么顺序不能乱**：如果先 add to ready 再 init ucontext，调度器可能在 context 还没设置好时就选中这个任务——RIP 是垃圾值，CPU 跳到随机地址，当场崩溃。
+
+**关于 malloc**：`malloc` 是向操作系统"申请一块内存"，返回的是那块内存的**起始地址**，不是大小。
+
+```c
+tcb_t *task = malloc(sizeof(tcb_t));
+//  task 是个指针，存的是地址（如 0x100000），不是 sizeof(tcb_t) 的值（120）
+//  大小信息在堆管理器内部记录着，方便 free 时知道要释放多少
+```
+
+用 `malloc` 而不是直接定义变量的原因：任务是**运行时动态创建**的——写代码时不知道要建几个任务、每个多大栈。`malloc` 在堆上分配，内存的生命周期不受函数调用栈限制，不会因为 `task_create` 返回就失效。
+```
+
 ### 4.3 就绪列表的组织
 
 ```c
@@ -389,6 +502,23 @@ task_add_to_ready(&idle_task_tcb);
 ```
 
 空闲任务是 RTOS 的"安全网"——确保 CPU 永远不会没有任务可运行。在真实系统中，空闲任务调用 `__WFI()` 进入低功耗模式。
+
+**深入理解：IDLE_PRIORITY 到底起了什么作用？**
+
+`IDLE_PRIORITY = 7` 的作用体现在调度器的优先级查找机制 `find_highest_priority_task()` 中：
+
+```c
+// kernel.c - 从 prio=0（最高）开始扫描
+for (int prio = 0; prio < MAX_PRIORITIES; prio++) {
+    if (!list_is_empty(&ready_lists[prio])) {  // 找到第一个非空链表
+        return list_entry(list_first(&ready_lists[prio]), tcb_t, node);
+    }
+}
+```
+
+空闲任务被钉在最低优先级（7），只要 0~6 级上有任何任务就绪，空闲任务就绝不可能被选中。只有当所有用户任务（如 Task High prio=2, Task Low prio=4）都在延时阻塞状态时，调度器才会一路扫描到 `ready_lists[7]`，选中空闲任务。
+
+一句话：**永远把空闲任务标记成最低优先级，只有当没有更要紧的任务时才会执行它。**
 
 ### 4.5 学习检查点
 
@@ -431,6 +561,26 @@ Priority 7: [idle]
 
 **从 Task A 的视角看**：调用了一个"非常慢的函数"(`swapcontext`)，等它返回时，自己又继续执行了——完全不知道中间 Task B 运行过。
 
+**形象比喻：ucontext_t 就是每个任务的"记事本"**
+
+`ucontext_t` 是 CPU 在某一个瞬间的完整寄存器快照。就像每个任务都有一个记事本，记录着"我的工作做到哪里了"：
+
+| 记事本上记什么 | 对应寄存器 | 具体含义 |
+|---|---|---|
+| "做到第几行了" | **RIP** | 当前执行到代码的哪条指令 |
+| "用哪张草稿纸" | **RSP / RBP** | 当前用哪个栈、栈用到了哪 |
+| "算出来的中间结果" | **RAX, RBX, RCX...** | 函数返回值、循环计数器、临时计算结果 |
+
+`swapcontext()` 做的事就是：
+
+```
+1. Task A 把当前手里的活全部记到自己记事本上（保存所有寄存器到 A.context）
+2. 翻开 Task B 的记事本，照着恢复：做到哪了、草稿纸上有什么、中间结果是多少（从 B.context 恢复所有寄存器）
+3. CPU 直接从 Task B 上次停下的地方接着跑
+```
+
+注意：恢复的寄存器里包含 RSP（栈指针），所以"切换栈"只是"切换所有寄存器"的其中一步——恢复 B.context 时 RSP 自然就指向 B 的栈了。
+
 ### 5.2 ucontext 机制详解
 
 在 ARM 硬件上，上下文切换用汇编操作 PendSV 异常实现。在 PC 上，我们用 POSIX 的 `ucontext.h` 模拟。
@@ -441,7 +591,48 @@ Priority 7: [idle]
 
 **`swapcontext(from, to)`**：等价于 `getcontext(from)` + `setcontext(to)`。保存当前状态到 `from`，恢复 `to` 的状态。
 
-**`setcontext(ctx)`**：跳转到 `ctx` 保存的状态，不保存当前状态（"一去不回"）。
+**`setcontext(ctx)`**：跳转到 `ctx` 保存的状态，**不保存**当前状态（"一去不回"，单程票）。
+
+**`setcontext` vs `swapcontext` 的本质区别**：
+
+| | `setcontext(ctx)` | `swapcontext(from, to)` |
+|---|---|---|
+| 保存当前位置 | 不保存 | 保存到 `from->context` |
+| 跳到目标 | 跳到 `ctx` | 跳到 `to->context` |
+| 以后能回来吗 | 不能，单程票 | 能，别人切回 from 就从调用处之后继续 |
+| 用在哪 | `kernel_start` 首次启动，main 上下文直接丢弃 | 任务之间互相切换 |
+
+所以启动时用 `setcontext`（main 不需要被保存），之后任务间切换用 `swapcontext`（A 和 B 互相保存对方的进度）。
+
+**关于字段命名 `uc_stack.ss_size`**：
+
+```c
+task->context.uc_stack.ss_size
+//       ↑        ↑       ↑
+//   ucontext_t  栈配置   栈大小
+//   (uc =       (ss =   (size =
+//   ucontext)  stack)  stack size)
+```
+
+这些字段来自 POSIX 标准定义在 `<ucontext.h>` 中：
+
+```c
+typedef struct ucontext_t {
+    ucontext_t *uc_link;       // uc = ucontext 缩写
+    sigset_t    uc_sigmask;    // 信号掩码
+    stack_t     uc_stack;      // 栈信息
+    mcontext_t  uc_mcontext;   // 机器上下文（寄存器值）
+    ...
+} ucontext_t;
+
+typedef struct {
+    void  *ss_sp;       // ss = stack, sp = stack pointer（栈起始地址）
+    size_t ss_size;     // ss = stack, size = 栈字节大小
+    int    ss_flags;    // 标志位
+} stack_t;
+```
+
+拆开读就是：`task->context`（任务的 CPU 快照）的 `.uc_stack`（栈配置）的 `.ss_size`（大小）。
 
 ### 5.3 代码流程
 
@@ -482,6 +673,77 @@ Task A 运行到一半，被 Task B 抢占。
 ```
 
 每个任务有独立栈 = 每个任务的调用帧互不干扰。
+
+**形象比喻：车间 + 工位 + 工作台卡**
+
+把整个 RTOS 系统想象成一个只有**一个工人（CPU 单核）**的车间：
+
+```
+车间里：
+  ┌─────────────────────────────────────────────────────────┐
+  │                                                         │
+  │   [工位]  ← 工人一次只能坐一个工位干活                    │
+  │                                                         │
+  │   工位 A          工位 B          工位 C                 │
+  │  ┌─────────┐    ┌─────────┐    ┌─────────┐              │
+  │  │ 图纸翻到  │    │ 图纸翻到  │    │ 图纸翻到  │             │
+  │  │ 第3页    │    │ 第7页    │    │ 第1页    │             │
+  │  │          │    │          │    │          │              │
+  │  │ 草稿纸上  │    │ 草稿纸上  │    │ 草稿纸上  │             │
+  │  │ 结果=42  │    │ 结果=99  │    │ 结果=0   │             │
+  │  │          │    │          │    │          │              │
+  │  │ 待办便签  │    │ 待办便签  │    │          │              │
+  │  │ "等零件"  │    │ "继续算"  │    │          │              │
+  │  └─────────┘    └─────────┘    └─────────┘              │
+  │                                                         │
+  └─────────────────────────────────────────────────────────┘
+```
+
+| 车间概念 | RTOS 对应 | 说明 |
+|---------|----------|------|
+| 工位 | 任务的栈（那块 malloc 内存） | 一个任务独占一个工位，工位之间互不干扰 |
+| 图纸翻到第几页 | RIP | 代码执行到哪条指令了 |
+| 草稿纸上的结果 | RAX, RBX 等通用寄存器 | 中间计算结果 |
+| 等待时间的留言 | delay_ticks | 被告知要等待多久 |
+| 待办便签 | state（READY/BLOCKED/RUNNING） | 任务状态 |
+| 工作台卡 | TCB | 记录这个工位的一切信息 |
+| 工人 | CPU 单核 | 同一时刻只能坐一个工位 |
+| 车间主任 | 调度器 scheduler | 决定让工人换到哪个工位干活 |
+
+**调度过程：**
+
+```
+1. 工人在工位 A 干活 → Task A RUNNING
+2. Task A 说"我在等零件来（延时）" → task_delay(10)
+3. 车间主任喊：停！把当前进度记在工作台卡 A 上 → 保存所有寄存器到 A.context
+4. 工人走到工位 B，翻开工作台卡 B → 恢复 B.context
+5. 工人照着 B 的图纸和草稿纸接着干 → Task B RUNNING
+6. 等 A 的零件到了（10 个 tick 到了）→ A 从延时链表回到就绪链表（READY）
+7. 车间主任觉得 B 该暂停了 → 保存 B 的进度到 B.context
+8. 工人回到工位 A，翻开工作台卡 A，接着第三步的进度继续 → Task A RUNNING
+```
+
+**每个工位的桌面（栈）结构：**
+
+```
+工位 A 的桌面（栈，8KB 内存块）：
+  高地址 ┌────────────────┐
+        │ funcA 的局部变量  │  ← 调用 funcA 时压的
+        │ funcB 的局部变量  │  ← funcA 调了 funcB，又压一层
+        │ 返回地址         │  ← funcB 执行完该回到哪
+  RSP → │ 当前函数局部变量  │  ← 现在在用这部分
+  低地址 └────────────────┘
+
+工位 B 的桌面（另一块独立的 8KB 内存块）：
+  高地址 ┌────────────────┐
+        │ funcX 的局部变量  │
+  RSP → │ funcY 的局部变量  │
+  低地址 └────────────────┘
+```
+
+核心就是：**工人只有一个，但每个工位都有自己完整的一套资料。切换工位 = 保存当前桌面状态 + 恢复另一个桌面状态。工位之间互不干扰。**
+
+这也是为什么"一个栈 = 一个任务，严格一对一，不能共享"——如果两个任务共用一个栈，相当于把东西写在同一个桌面上的同一个位置，前后覆盖，数据就烂了。
 
 ### 5.5 学习检查点
 
@@ -558,6 +820,17 @@ void task_yield(void) {
 ```
 
 把自己移到链表尾部 → 同优先级的其他任务有机会运行 → FIFO 公平性。
+
+**task_yield() vs task_delay() 的本质区别**：
+
+| | `task_yield()` | `task_delay(N)` |
+|---|---|---|
+| 任务去哪里 | 留在就绪链表尾部 | 移到延时链表（阻塞态 BLOCKED） |
+| 下次什么时候跑 | 同优先级任务轮完一圈就轮回来 | 等 N 个 tick 到期才唤醒 |
+| 用途 | **同优先级时间片轮转** | 延时等待（等数据、等外设、周期性任务） |
+| 状态转换 | RUNNING → READY（还在就绪链表） | RUNNING → BLOCKED → tick到期 → READY |
+
+关键区别：`task_delay()` 是从就绪链表**摘走**，放到延时链表，等倒计时到零才回来。`task_yield()` 只是把自己**挪到**就绪链表尾部，马上就能被再次调度，只是让同优先级任务先跑一轮。
 
 ### 6.4 第一个任务如何启动
 
@@ -638,9 +911,76 @@ static void process_tick(void) {
             task_add_to_ready(task);   // 状态变为 READY
         }
     }
-    port_clear_tick();
+    port_clear_tick();   // ← 这一行做了什么？
 }
 ```
+
+**`port_clear_tick()` 有什么用？**
+
+实现就一句话：`tick_pending = 0;` —— 把 tick 标记擦掉。
+
+```
+SIGALRM 信号到来 → tick_pending = 1;  // "有人敲门"
+
+schedule() → process_tick()
+  ├─ tick_count++
+  ├─ 遍历延迟链表，递减 delay_ticks，到期的搬回就绪链表
+  └─ port_clear_tick();  // tick_pending = 0  "处理完了，擦掉标记"
+```
+
+如果不擦掉，下次 `schedule()` 被调用时会再执行一遍 `process_tick()`，重复递减 `delay_ticks`，导致延时还没到就被错误唤醒。必须"处理完就清"，保证每个 tick 只处理一次。
+
+**每个 tick 结束后 schedule() 都要跑一遍吗？**
+
+**不是。** `tick_pending` 是布尔标志，不是计数器。schedule() 只在三个地方被调用：
+
+| 调用位置 | 触发时机 |
+|---------|---------|
+| `task_yield()` | 任务主动让出 CPU |
+| `task_delay()` | 任务延时阻塞 |
+| `idle_task_func()` | 空闲任务发现有 tick 待处理 |
+
+如果某个任务一直干活不 yield 不 delay（比如一个死循环算东西），schedule() 可能好几个 tick 都不跑一次。所有 tick 信号都被"压缩"成 `tick_pending = 1` 这一个标志位——布尔标志只能表示"有没有"，不能表示"有几个"。
+
+**那延时的 tick 计数不就错了吗？**
+
+理论上确实会丢 tick：多个 tick 到来，`tick_pending` 始终是 1，`schedule()` 只处理一次，`process_tick()` 只减一次 `delay_ticks`。
+
+但在这个项目的 demo 中实际不会出错，因为任务延时很短——Task Low 每 3 个 tick 调一次 `task_delay()`，Task High 每 10 个 tick 调一次，`schedule()` 频繁被调用，tick 来不及堆积。
+
+真正会出问题的场景是：有个任务长时间不调 yield/delay（如 `compute_10_seconds()`），那期间的所有 tick 全部丢失，延时链表上的任务得不到精确唤醒。这就是 §8.3 要讨论的 PC 模拟与真实硬件的差距。
+
+**"tick 到期"到底是什么意思？**
+
+所谓"tick 到期"就是 **`delay_ticks` 从 N 递减到 0 的那一刻**，像一个倒计时闹钟：
+
+```
+task_delay(5) → delay_ticks = 5
+tick 1: delay_ticks 减到 4
+tick 2: delay_ticks 减到 3
+tick 3: delay_ticks 减到 2
+tick 4: delay_ticks 减到 1
+tick 5: delay_ticks 减到 0 → "到期"！摘下来放回就绪链表
+```
+
+每个任务在 TCB 里都有独立的 `delay_ticks` 字段，各个任务各自倒计时，互不影响。
+
+**为什么 tick 到期后是 READY 而不是 RUNNING？**
+
+tick 到期只是取消了任务的"阻塞"状态，把它放回就绪链表。但能不能立刻跑，还要看调度器：
+
+- 如果它的优先级**最高** → `schedule()` 选中它，READY → RUNNING
+- 如果还有**更高优先级**的任务在就绪态 → 它留在 READY，排队等着
+
+所以状态转换是 `BLOCKED → tick到期 → READY → scheduler选中 → RUNNING`，分开的。
+
+**每个任务的延时长短可以各自设置吗？**
+
+可以，每个任务调 `task_delay(N)` 时各自传不同的 `N`，互不影响。例如 demo.c 里 Task High 等 10 个 tick，Task Low 等 3 个 tick。`process_tick()` 逐个递减，各减各的。
+
+**task_delay() 模拟的是什么？**
+
+它模拟的是"任务在等待某个条件，暂时没事干"——等外设数据、等硬件操作完成、等按键去抖、或者纯粹是周期性任务（每 100ms 采集一次）。关键是不做忙等（busy loop），而是把 CPU 让出来给其他任务用。
 
 **时间复杂度**：O(N_delayed)，每次 tick 遍历所有延时任务。FreeRTOS 将延时链表按到期时间**排序**，只需检查链表头部的任务，优化到 O(1) 摊销。
 
@@ -693,6 +1033,31 @@ static void tick_signal_handler(int sig) {
 ```
 
 `SIGALRM` 可能在**任何时刻**触发——包括正在 `list_insert_tail()` 的中间。如果 handler 中直接操作链表，会导致数据损坏。因此 handler 只设置 `sig_atomic_t` 标志，实际的链表操作推迟到 `schedule()`（中断被阻塞时）进行。
+
+**如果硬要在信号处理函数里操作链表会怎样？**
+
+假设 Task A 正在往就绪链表插节点，`list_insert_tail()` 执行到一半：
+
+```c
+// list.c - list_insert_tail()，四个步骤
+node->next = &list->sentinel;        // ① 刚执行完
+//          ↑ SIGALRM 信号在这里到来！CPU 跳到信号处理函数
+node->prev = list->sentinel.prev;    // ② 还没来得及执行
+list->sentinel.prev->next = node;    // ③
+list->sentinel.prev = node;          // ④
+```
+
+此时链表是**半成品**：`node->next` 指向 sentinel，但 sentinel 还没指向 node，其他节点的指针也悬着。
+
+```
+链表现在长这样（已经烂了）：
+  sentinel ←?→ [Node X]     [新 node 半挂着]
+       ↑ next 指什么？      ↑ prev 还是垃圾值/旧值
+```
+
+如果信号处理函数此时也去操作链表（遍历、删除、插入），读到这个半成品——要么指针飞到非法地址**崩溃**，要么**静默地操作了错误节点**，产生更难排查的 bug。
+
+这种并发问题叫 **race condition**：信号处理函数可能在任意一条机器指令之间插入执行，完全不可预测。可能 99.9% 的时间不出问题，第 1000 次运行才崩。
 
 ### 7.6 学习检查点
 
@@ -760,6 +1125,37 @@ tick 12: LOW 运行 → delay(3)
 | 临界区 | 阻塞 SIGALRM | 禁用中断 (BASEPRI / PRIMASK) |
 
 **为什么 PC 上不是在任意时刻抢占？** 因为信号 handler 中操作内核数据结构不安全（不是异步信号安全的）。真实硬件没有这个问题——中断 handler 中可以直接操作就绪链表，因为硬件保证中断上下文不会被其他中断打断（同优先级或更低优先级的中断被屏蔽）。
+
+**ARM 硬件为什么可以安全操作？四层保护机制：**
+
+**第一层：硬件自动关中断。** ARM 上进入 SysTick ISR 的瞬间，CPU 硬件自动屏蔽同优先级和更低优先级的所有中断。不会有第二个中断来打断你的 ISR。退出 ISR 时硬件自动恢复。整个过程不需要软件干预。
+
+对比 PC：SIGALRM 信号随时可能到来，没有任何硬件保护，可能打断任何一条机器指令，包括 `list_insert_tail` 写到一半。
+
+**第二层：硬件自动保存一半寄存器。** ARM 进中断时，CPU **硬件自动压栈** R0-R3, R12, LR, PC, xPSR 这 8 个寄存器到当前任务的栈上。不需要软件做任何事。退出中断时硬件自动弹出恢复。
+
+对比 PC：信号来了，操作系统在内核态手动保存全部寄存器，再切回用户态跑 handler——代价大，而且用的是同一个栈。
+
+**第三层：PendSV（可挂起系统服务）的分层设计。** ARM 上真正做上下文切换的不是 SysTick ISR，而是一个叫 PendSV 的异常：
+
+```
+优先级（数字越大越低）：
+  高  SysTick ISR   → 只做 tick 计数 + 延时到期判断 + 触发 PendSV
+  中  其他外设中断   → 正常处理
+  低  PendSV        → 真正做上下文切换（改链表、切栈、swap）
+```
+
+PendSV 优先级设成**最低**，意味着它只在所有其他中断都处理完、CPU 准备返回任务时才会运行。绝对不会打断任何 ISR 的链表操作。FreeRTOS 的命名就是从这里来的——**Pen**ding **S**er**V**ice。
+
+对比 PC：没有 PendSV 这种分层机制，SIGALRM 只有一个优先级，没法分层。
+
+**第四层：关中断是一条指令。** ARM 上进入临界区只需一条汇编指令 `CPSID I`（1 个 CPU 周期），退出用 `CPSIE I`。极快，极可靠。
+
+对比 PC：`sigprocmask()` 是一个系统调用，需要从用户态陷入内核态再返回，开销巨大，而且它本身就不是 async-signal-safe 的。
+
+---
+
+**一句话总结**：ARM 用"硬件自动关中断 + 自动压栈 + PendSV 分层 + 单指令临界区"四层保护，让 ISR 里操作数据结构既安全又高效。PC 的信号是操作系统软件层面硬塞进来的，"随时打断 + 没有分层 + 系统调用开销大"，只能妥协为"设标志，推迟处理"。
 
 ### 8.4 临界区保护
 
