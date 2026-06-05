@@ -140,9 +140,63 @@ static void schedule_select_and_switch(void)
            prev->name, prev->priority,
            next->name, next->priority);
 
+    /* ---- 保存 prev 的关键寄存器快照 (证明保存/恢复一致) ---- */
+#ifndef _WIN32
+#if defined(__aarch64__)
+    uint64_t sp_snap, fp_snap, lr_snap;
+    __asm__ volatile("mov %0, sp"  : "=r"(sp_snap));
+    __asm__ volatile("mov %0, x29" : "=r"(fp_snap));
+    __asm__ volatile("mov %0, x30" : "=r"(lr_snap));
+    printf("[save]    %-10s  SP=0x%016llx  FP=0x%016llx  LR=0x%016llx\n",
+           prev->name,
+           (unsigned long long)sp_snap,
+           (unsigned long long)fp_snap,
+           (unsigned long long)lr_snap);
+#elif defined(__x86_64__)
+    uint64_t sp_snap, bp_snap;
+    __asm__ volatile("movq %%rsp, %0" : "=r"(sp_snap));
+    __asm__ volatile("movq %%rbp, %0" : "=r"(bp_snap));
+    printf("[save]    %-10s  SP=0x%016llx  BP=0x%016llx\n",
+           prev->name,
+           (unsigned long long)sp_snap,
+           (unsigned long long)bp_snap);
+#endif
+#endif
+
     port_switch_context(prev, next);
-    /* ---- 任务切换发生在这里 ---- */
-    /* 当 prev 再次被调度时，从这里继续 */
+
+    /* 当 prev 再次被调度时，从此处继续执行。
+     * sp_snap / fp_snap 等局部变量随栈/寄存器一起被 swapcontext 恢复，
+     * 值与原封不动。重新读寄存器与之比对。 */
+#ifndef _WIN32
+#if defined(__aarch64__)
+    {
+        uint64_t sp_now, fp_now, lr_now;
+        __asm__ volatile("mov %0, sp"  : "=r"(sp_now));
+        __asm__ volatile("mov %0, x29" : "=r"(fp_now));
+        __asm__ volatile("mov %0, x30" : "=r"(lr_now));
+        printf("[restore] %-10s  SP=0x%016llx  FP=0x%016llx  LR=0x%016llx  %s\n",
+               current_task->name,
+               (unsigned long long)sp_now,
+               (unsigned long long)fp_now,
+               (unsigned long long)lr_now,
+               (sp_snap == sp_now && fp_snap == fp_now)
+                   ? "← 寄存器一致 ✓" : "← 不匹配! ✗");
+    }
+#elif defined(__x86_64__)
+    {
+        uint64_t sp_now, bp_now;
+        __asm__ volatile("movq %%rsp, %0" : "=r"(sp_now));
+        __asm__ volatile("movq %%rbp, %0" : "=r"(bp_now));
+        printf("[restore] %-10s  SP=0x%016llx  BP=0x%016llx  %s\n",
+               current_task->name,
+               (unsigned long long)sp_now,
+               (unsigned long long)bp_now,
+               (sp_snap == sp_now && bp_snap == bp_now)
+                   ? "← 寄存器一致 ✓" : "← 不匹配! ✗");
+    }
+#endif
+#endif
 }
 
 /* -------------------------------------------------------------------
