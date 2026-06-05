@@ -1,12 +1,13 @@
 # Lite RTOS 从零学习教程
 
-> 一个模仿 FreeRTOS 实现的微型实时操作系统内核，总计约 930 行 C 代码。
+> 一个模仿 FreeRTOS 实现的微型实时操作系统内核，总计约 1500 行 C 代码。
 > 本文档带你从零开始理解每一行代码的设计意图。
 
 ---
 
 ## 目录
 
+0. [新手入门：内核运行完整流程](#0-新手入门内核运行的完整流程10-分钟预览)
 1. [概述：实时操作系统解决什么问题？](#1-概述实时操作系统解决什么问题)
 2. [整体架构一览](#2-整体架构一览)
 3. [Phase 1：基础数据结构和侵入式链表](#3-phase-1基础数据结构和侵入式链表)
@@ -17,8 +18,134 @@
 8. [Phase 6：抢占式调度（延迟抢占）](#8-phase-6抢占式调度延迟抢占)
 9. [Phase 7：真抢占式调度（ISR 驱动）](#9-phase-7真抢占式调度isr-驱动)
 10. [完整执行流程追踪](#10-完整执行流程追踪)
-11. [与 FreeRTOS 的对比](#11-与-freertos-的对比)
-12. [扩展方向](#12-扩展方向)
+11. [Phase 9：可变 Tick 间隔 + 毫秒级延时](#11-phase-9可变-tick-间隔--毫秒级延时)
+12. [Phase 10：任务数量上限控制](#12-phase-10任务数量上限控制)
+13. [Phase 11：计数信号量 (Counting Semaphore)](#13-phase-11计数信号量-counting-semaphore)
+14. [与 FreeRTOS 的对比](#14-与-freertos-的对比)
+15. [扩展方向](#15-扩展方向)
+16. [附录 A：编译与运行](#附录-a编译与运行)
+17. [附录 B：关键文件阅读顺序](#附录-b关键文件阅读顺序)
+18. [附录 C：常见面试/理解问题](#附录-c常见面试理解问题)
+
+---
+
+## 0. 新手入门：内核运行的完整流程（10 分钟预览）
+
+如果你是第一次接触 RTOS，建议先读这一节——不深究细节，只看"内核从头到尾做了什么"。读完你会对后续各 Phase 的内容有一个全局框架。
+
+### 从 `main()` 到第一个任务
+
+```
+main()
+  │
+  ├─ kernel_init()                  ← ① 初始化: 创建就绪链表、延时链表、idle 任务
+  │
+  ├─ kernel_set_tick_interval_ms(10) ← ② 配置: 设系统心跳为 10ms/次
+  │
+  ├─ task_create(task_a, "A", 0, 0) ← ③ 创建任务: 分配 TCB + 独立栈 + 初始化 CPU 上下文
+  ├─ task_create(task_b, "B", 0, 2) ←    每个任务都会调用 port_init_task_context()
+  │                                   设置 "第一次运行的现场"
+  │
+  ├─ kernel_start()                 ← ④ 启动!
+  │   ├─ port_init_tick_timer()     ←    开启 10ms 定时器 (硬件心跳)
+  │   ├─ find_highest_priority_task() ←  选优先级最高的就绪任务
+  │   └─ port_start_first_task(A)   ←    跳转到 Task A 的代码!
+  │
+  └─ // 永远不会执行到这里
+```
+
+### 任务运行时：上下文切换的全貌
+
+当 Task A 正在运行，它调用 `task_delay(5)`（"我要等 5 个 tick"）：
+
+```
+Task A 运行中
+  │
+  ├─ task_delay(5)
+  │   ├─ port_disable_interrupts()     ← 关闭中断, 保护内核数据
+  │   ├─ task_remove_from_ready(A)     ← 把 A 从就绪链表摘掉
+  │   ├─ A->state = TASK_BLOCKED       ← 标记"我在等"
+  │   ├─ A->delay_ticks = 5            ← 设倒计时
+  │   ├─ list_insert_tail(delayed_list, &A->node)  ← A 挂到延时链表
+  │   ├─ port_enable_interrupts()      ← 开中断
+  │   └─ schedule()                    ← "谁该跑?"
+  │       ├─ 扫描 ready_lists[0..7]    ← 从高到低找就绪任务
+  │       ├─ 找到 Task B (prio 2)
+  │       └─ swapcontext(A, B)         ← ★ CPU 上下文切换!
+  │           ├─ 保存 A 的所有寄存器 → A.context
+  │           └─ 恢复 B 的所有寄存器 ← B.context
+  │
+Task B 开始运行 (从上次停下的地方继续)
+  │
+  ├─ ... B 做了些事 ...
+  ├─ task_delay(3)                     ← B 也延时
+  │   └─ schedule() → 只剩 idle → swapcontext(B, idle)
+  │
+idle 任务运行                           ← CPU 永不停歇
+  │   └─ 循环: 检查 tick_pending, 有就处理
+  │
+  ├─ [10ms 到!]  SIGALRM 信号触发
+  │   └─ schedule_from_isr()
+  │       ├─ process_tick()            ← tick_count++; 遍历延时链表
+  │       │   ├─ A->delay_ticks: 5→4  ← 还没到
+  │       │   └─ B->delay_ticks: 3→2  ← 还没到
+  │       ├─ find_highest_priority_task() → idle (仍在就绪)
+  │       └─ swapcontext(idle, idle)   ← 无切换, 继续 idle
+  │
+  ├─ [又 10ms]  SIGALRM → process_tick() → A:4→3, B:2→1
+  ├─ [又 10ms]  SIGALRM → process_tick() → A:3→2, B:1→0 ★
+  │                                       → B 到期! 放回 ready_lists[2]
+  │                                       → swapcontext(idle, B) ← 切到 B!
+Task B 继续运行 (从 task_delay 之后)
+```
+
+### 多任务数据流：信号量如何工作
+
+```
+Task A "IR 传感器" (prio 0)          Task B "障碍分析" (prio 2)
+  │                                      │
+  ├─ 采集 ir_distance=150                ├─ sem_take(&sem_data) → count=0
+  ├─ sem_give(&sem_data)                 │   加入 sem_data.wait_list (排队)
+  │   └─ 弹出 B, task_add_to_ready(B)    │   schedule() → 切走
+  │                                      │   (B 在此冻结)
+  ├─ task_delay_ms(50)                   │
+  │   └─ schedule() → 选 B (prio 2)      │
+  │                                      ├─ ★ B 被唤醒!
+  │                                      ├─ 读取 ir_distance=150
+  │                                      ├─ 分析: 安全 (≥100)
+  │                                      └─ task_delay_ms(20)
+```
+
+### 内核的四个核心数据结构
+
+```
+ready_lists[0..7]          delayed_list              sem->wait_list
+┌─┬─┬─┬─┬─┬─┬─┬─┐         ┌──────────────┐         ┌──────────────┐
+│0│1│2│3│4│5│6│7│         │ sentinel     │         │ sentinel     │
+│ │ │B│ │ │ │ │i│         │  ↑       ↓   │         │  ↑       ↓   │
+│ │ │ │ │ │ │ │d│         │ [A] ←→ [C]   │         │ [B] ←→ [D]   │
+│ │ │ │ │ │ │ │l│         └──────────────┘         └──────────────┘
+│ │ │ │ │ │ │ │e│          任务在"等时间"             任务在"等事件"
+└─┴─┴─┴─┴─┴─┴─┴─┘
+  任务在"等 CPU"
+
+一个任务 (TCB) 只能处于其中一个链表中 (TCB 只有一个 node 成员)。
+调度器的工作 = 在这三组链表之间搬运任务。
+```
+
+### 阅读路线建议
+
+| 你想了解 | 读这个 Phase | 预计时间 |
+|----------|-------------|----------|
+| 链表怎么串起任务 | Phase 1 (§3) | 15 分钟 |
+| 任务如何创建 | Phase 2 (§4) | 10 分钟 |
+| CPU 怎么在任务间切换 | Phase 3 (§5) | 20 分钟 |
+| 调度器怎么选任务 | Phase 4 (§6) | 10 分钟 |
+| 延时和 tick | Phase 5 (§7) | 15 分钟 |
+| 抢占 | Phase 6-7 (§8-9) | 20 分钟 |
+| 完整执行追踪 | §10 | 15 分钟 |
+| 任务数量限制 | Phase 10 (§12) | 10 分钟 |
+| 信号量 (任务同步) | Phase 11 (§13) | 25 分钟 |
 
 ---
 
@@ -101,7 +228,7 @@ void task_heartbeat(void) { // 最高优先级
 | `list.h/c` | 双向循环链表（侵入式） | `list.h/c` |
 | `task.h/c` | `task_create()`、`task_delay()`、就绪列表操作 | `tasks.c` |
 | `port.h/c` | ucontext 上下文切换、SIGALRM 系统节拍、临界区 | `port.c` (移植层) |
-| `demo.c` | 示例应用 | 你的 `main.c` |
+| `demo_*.c` | 示例应用 (多个 Phase 对应不同 Demo) | 你的 `main.c` |
 
 ---
 
@@ -400,22 +527,26 @@ make clean && make          # 应该零警告编译通过
 
 ```c
 typedef struct tcb {
-    /* --- 上下文信息 --- */
-    ucontext_t      context;        // CPU 寄存器快照 (RIP, RSP, RBP...)
-    uint8_t        *stack;          // 任务专属栈的起始地址
-    uint32_t        stack_size;     // 栈大小 (字节)
+    /* --- 上下文信息 (平台相关) --- */
+#ifdef _WIN32
+    void               *fiber;         // Windows: Fiber 句柄
+#else
+    ucontext_t          context;        // Unix: CPU 寄存器快照 (RIP, RSP, RBP...)
+#endif
+    uint8_t            *stack;          // 任务专属栈的起始地址
+    uint32_t            stack_size;     // 栈大小 (字节)
 
     /* --- 任务属性 --- */
-    uint8_t         priority;       // 当前优先级 (0 最高)
-    uint8_t         base_priority;  // 基础优先级 (预留给互斥量)
-    uint8_t         state;          // READY / RUNNING / BLOCKED
-    char            name[16];       // 调试用任务名
+    uint8_t             priority;       // 当前优先级 (0 最高)
+    uint8_t             base_priority;  // 基础优先级 (预留给互斥量)
+    uint8_t             state;          // READY / RUNNING / BLOCKED
+    char                name[16];       // 调试用任务名
 
     /* --- 延时信息 --- */
-    uint32_t        delay_ticks;    // 还需等待的 tick 数
+    uint32_t            delay_ticks;    // 还需等待的 tick 数
 
     /* --- 链表节点 (嵌入!) --- */
-    list_node_t     node;           // 挂在 ready_lists[] 或 delayed_list
+    list_node_t         node;           // 挂在 ready_lists[] 或 delayed_list
 } tcb_t;
 ```
 
@@ -640,10 +771,14 @@ typedef struct {
 ```c
 // ① 创建任务时：设置 "第一次运行的现场"
 void port_init_task_context(tcb_t *task, void (*task_func)(void)) {
-    getcontext(&task->context);                    // 获取当前 CPU 状态作为模板
-    task->context.uc_stack.ss_sp = task->stack;     // 替换栈指针：指向任务专属栈
-    task->context.uc_stack.ss_size = task->stack_size;
-    makecontext(&task->context, task_func, 0);      // 设置入口函数
+    if (getcontext(&task->context) == -1) {        // 获取当前 CPU 状态作为模板
+        perror("getcontext"); exit(1);
+    }
+    task->context.uc_stack.ss_sp    = task->stack; // 替换栈指针：指向任务专属栈
+    task->context.uc_stack.ss_size  = task->stack_size;
+    task->context.uc_stack.ss_flags = 0;           // 无特殊标志
+    task->context.uc_link = NULL;                  // 函数返回时线程退出 (不 fall through)
+    makecontext(&task->context, (void (*)(void))task_func, 0);  // 设置入口函数
 }
 // 当这个 context 首次被激活时，CPU 会：
 //   1. 切换到 task->stack 指向的栈
@@ -780,33 +915,49 @@ static tcb_t *find_highest_priority_task(void) {
 
 ### 6.2 schedule() 函数
 
-这是内核的心脏：
+这是内核的心脏。当前实现将调度分成两层：
 
 ```c
-void schedule(void) {
-    port_disable_interrupts();        // 临界区：禁止中断打断链表操作
+/* 入口层: schedule() — 任务上下文调用 (task_delay / task_yield / idle) */
+void schedule(void)
+{
+    port_disable_interrupts();       // 临界区：保护链表操作
 
-    // ① 处理 tick（Phase 5 详解）
+#ifdef _WIN32
+    /* Windows: tick 由后台线程设置标志，这里处理 */
     if (port_tick_pending()) { process_tick(); }
+#else
+    /* Unix: tick 已由 schedule_from_isr() 在信号上下文中处理,
+     *       这里仅清除可能残留的标志 (防止关中断期间遗漏的 tick 被重复处理) */
+    if (port_tick_pending()) { port_clear_tick(); }
+#endif
 
-    // ② 选择最高优先级的就绪任务
+    port_enable_interrupts();        // 开中断 → 选任务 → 切换
+    schedule_select_and_switch();    // ← 委托给共享调度核心
+}
+
+/* 核心层: schedule_select_and_switch() — 共享调度核心 (异步信号安全) */
+static void schedule_select_and_switch(void)
+{
     tcb_t *next = find_highest_priority_task();
 
-    // ③ 如果和当前任务不同，切换
-    if (next != current_task) {
-        tcb_t *prev = current_task;
-        prev->state = TASK_READY;
-        next->state = TASK_RUNNING;
-        current_task = next;
-
-        port_enable_interrupts();
-        port_switch_context(prev, next);  // ← 上下文切换发生在这里！
-        // ─────────────────────────────────────
-        // prev 下次被调度时从这里继续
-        // ─────────────────────────────────────
-    } else {
-        port_enable_interrupts();
+    /* idle 任务始终就绪，next 不可能为 NULL */
+    if (next == NULL || next == current_task) {
+        return;                      // 无需切换
     }
+
+    tcb_t *prev = current_task;
+
+    if (prev->state == TASK_RUNNING) {
+        prev->state = TASK_READY;    // 前任务变为就绪态
+    }
+    next->state = TASK_RUNNING;     // 新任务变为运行态
+    current_task = next;
+
+    port_switch_context(prev, next); // ← 上下文切换发生在这里！
+    // ─────────────────────────────────────
+    // prev 下次被调度时从这里继续
+    // ─────────────────────────────────────
 }
 ```
 
@@ -814,8 +965,12 @@ void schedule(void) {
 
 ```c
 void task_yield(void) {
+    port_disable_interrupts();             // ← 临界区：保护就绪链表
+
     task_remove_from_ready(current_task);  // 从就绪链表移除
     task_add_to_ready(current_task);       // 加到就绪链表尾部
+
+    port_enable_interrupts();              // ← 临界区结束
     schedule();                            // 触发调度
 }
 ```
@@ -837,9 +992,17 @@ void task_yield(void) {
 
 ```c
 void kernel_start(void) {
+    printf("[kernel] Starting scheduler...\n");
+
+    port_init_tick_timer();              // ← 启动系统节拍定时器!
+
     scheduler_running = 1;
 
     tcb_t *first = find_highest_priority_task();  // 选最高优先级
+    if (first == NULL) {                          // 安全检查
+        fprintf(stderr, "[kernel] ERROR: No task to start!\n");
+        exit(1);
+    }
     current_task = first;
     first->state = TASK_RUNNING;
 
@@ -883,16 +1046,30 @@ setitimer(ITIMER_REAL)  →  每 10ms 触发一次 SIGALRM
                         schedule() 中处理
 ```
 
-### 7.2 Tick 频率的选择
+### 7.2 Tick 间隔的设置
+
+Lite RTOS 提供两种 API 设置系统节拍间隔：
 
 ```c
-#define TICK_RATE_HZ     100          // 100 Hz
-#define TICK_INTERVAL_US (1000000/100) // = 10000μs = 10ms
+/* 推荐: 毫秒级 API — 直设硬件定时器间隔 */
+kernel_set_tick_interval_ms(10);   // 每 10ms 中断一次 (100Hz)
+kernel_set_tick_interval_ms(1);    // 每  1ms 中断一次 (1000Hz)
+
+/* 内部 API — 频率方式 (等价) */
+kernel_set_tick_rate(100);         // 100Hz = 10ms 间隔
 ```
 
-- **太高** (如 1000Hz)：CPU 频繁处理中断，开销大
-- **太低** (如 10Hz)：任务延时精度差
-- **100Hz**：10ms 精度，适合大多数嵌入式应用
+硬件层面，这个值直接转换为 SysTick（ARM）或 `setitimer`（Unix）的定时器重装值。例如 480MHz CPU 上设 10ms：
+
+```
+SysTick->LOAD = 480000000 × 0.01 - 1 = 4,799,999
+```
+
+每个 CPU 时钟周期 LOAD 减 1，减到 0 → 触发中断 → 硬件自动重装 → 软件零开销。
+
+- **太快** (1ms)：每秒 1000 次中断，CPU 开销可忽略（<0.1%），但省电模式下不理想
+- **太慢** (1000ms)：每 1 秒一次中断，省电但任务延时精度差
+- **默认 10ms**：适合大多数嵌入式应用和教学 demo
 
 ### 7.3 延时链表的处理
 
@@ -989,7 +1166,9 @@ tick 到期只是取消了任务的"阻塞"状态，把它放回就绪链表。�
 
 ```c
 void task_delay(uint32_t ticks) {
-    port_disable_interrupts();          // 临界区
+    if (ticks == 0) return;              // 延时 0 = 无操作
+
+    port_disable_interrupts();           // 临界区
 
     task_remove_from_ready(current_task);                 // ① 离开就绪列表
     current_task->state = TASK_BLOCKED;                   // ② 标记为阻塞
@@ -1024,6 +1203,39 @@ task_delay(5) 调用:
   │ Task A 从 task_delay() 的 schedule() 调用返回，继续执行  │
   └─────────────────────────────────────────────────────────┘
 ```
+
+### 7.4b task_delay_ms() — 毫秒级延时 (推荐)
+
+`task_delay()` 的参数是 tick 数，具体等多久取决于 tick 间隔——`task_delay(5)` 在 10ms/tick 时 = 50ms，在 1ms/tick 时 = 5ms。为此提供毫秒 API：
+
+```c
+// task.c + task.h
+void task_delay_ms(uint32_t ms)
+{
+    if (ms == 0) return;
+
+    /* 毫秒 → tick 换算: ticks = ceil(ms / interval_ms)
+     * 内部通过 kernel_get_tick_rate() 获取当前频率:
+     *   ticks = (ms * hz + 999) / 1000   (向上取整)
+     *
+     * 例如 tick 间隔=10ms (hz=100):
+     *   ms=50  → ticks=(50*100+999)/1000 = 5   → 实际 50ms
+     *   ms=15  → ticks=(15*100+999)/1000 = 2   → 实际 20ms (取整)
+     *
+     * 例如 tick 间隔=500ms (hz=2):
+     *   ms=500 → ticks=(500*2+999)/1000 = 2    → 实际 1000ms
+     */
+    uint32_t hz = kernel_get_tick_rate();
+    uint32_t ticks = ((uint64_t)ms * hz + 999) / 1000;
+    if (ticks == 0) ticks = 1;  /* 最小延时 1 tick */
+
+    task_delay(ticks);
+}
+```
+
+**性能开销**：一次乘法 + 一次除法，在 480MHz Cortex-M7 上 ≈ 3 个 CPU 周期（~6ns），完全可忽略。真正的开销是上下文切换本身（微秒级）。
+
+**设计原则**：`task_delay_ms()` 与 tick 间隔解耦——不管硬件 tick 是快是慢，传 50 就是等 50ms。这让 demo 代码在不同 tick 配置下都能正确运行。
 
 ### 7.5 信号安全：为什么 tick handler 只设置标志？（Phase 5/6 设计）
 
@@ -1169,12 +1381,20 @@ PendSV 优先级设成**最低**，意味着它只在所有其他中断都处理
 ### 8.4 临界区保护
 
 ```c
+static sigset_t block_mask;
+static int interrupts_disabled = 0;         // 嵌套计数保护
+
 void port_disable_interrupts(void) {
+    if (interrupts_disabled) return;         // 已关中断, 嵌套调用安全
+    interrupts_disabled = 1;
+    sigemptyset(&block_mask);
     sigaddset(&block_mask, SIGALRM);
     sigprocmask(SIG_BLOCK, &block_mask, NULL);  // 阻塞 SIGALRM
 }
 
 void port_enable_interrupts(void) {
+    if (!interrupts_disabled) return;        // 已开中断, 嵌套调用安全
+    interrupts_disabled = 0;
     sigprocmask(SIG_UNBLOCK, &block_mask, NULL);  // 恢复
 }
 ```
@@ -1338,22 +1558,29 @@ void schedule_from_isr(void)
 }
 ```
 
-**`schedule()`** — 任务上下文入口（简化后）：
+**`schedule()`** — 任务上下文入口（Phase 7 简化后）：
 
 ```c
 void schedule(void)
 {
     port_disable_interrupts();
 
-    if (port_tick_pending()) {
-        process_tick();
-    }
+#ifdef _WIN32
+    /* Windows: tick 由后台线程设置标志，这里处理 */
+    if (port_tick_pending()) { process_tick(); }
+#else
+    /* Unix: tick 已由 schedule_from_isr() 在信号上下文中处理，
+     *       这里仅清除残留标志，不做重复的 process_tick() */
+    if (port_tick_pending()) { port_clear_tick(); }
+#endif
 
     /* 先开中断再切换，确保新任务以中断开启状态运行 */
     port_enable_interrupts();
     schedule_select_and_switch();
 }
 ```
+
+**重要**：在 Unix 真抢占模式下，`schedule()` **不再**调用 `process_tick()`——tick 处理全部在 `schedule_from_isr()`（信号上下文）中完成。`schedule()` 只负责清除可能残余的 `tick_pending` 标志（关中断期间漏掉的 tick）。Windows 上仍然由 `schedule()` 调用 `process_tick()`（没有 ISR 驱动）。
 
 ### 9.4 信号掩码生命周期 — 这是正确性的关键
 
@@ -1599,35 +1826,34 @@ Task A (task_a_func 运行中)
   └─ // 回到 while(1) 循环，下一轮迭代
 ```
 
-### 10.3 Tick 处理流程 (延迟抢占路径)
+### 10.3 Tick 处理流程 (Windows 延迟抢占路径)
+
+Windows 上 tick 由后台线程设置标志，调度依赖任务主动调用 API。
+Unix 上 tick 由 SIGALRM 信号驱动，`schedule_from_isr()` 在 ISR 中直接完成（见 §10.4）。
 
 ```
-[硬件定时器] 每 10ms 触发 SIGALRM
+[后台线程] 每 10ms Sleep → tick_pending = 1
   │
-  ├─ (内核保存当前任务的所有寄存器到栈上)
-  ├─ tick_signal_handler(SIGALRM)
-  │   └─ tick_pending = 1;   // 只设置标志，不操作数据结构
-  ├─ (内核恢复寄存器)
-  └─ 返回到被中断的代码继续执行
-
-... 稍后，某个任务调用 task_delay() 或 task_yield() ...
-  │
-  └─ schedule()
-      ├─ port_disable_interrupts()       // 现在安全地屏蔽信号
-      ├─ if (port_tick_pending())
-      │   └─ process_tick()
-      │       ├─ tick_count++            // tick_count: N → N+1
-      │       ├─ 遍历 delayed_list
-      │       │   ├─ task_H: delay_ticks: 5→4 (未到期)
-      │       │   └─ task_L: delay_ticks: 1→0 (到期!)
-      │       │       ├─ list_remove(L 的 node)
-      │       │       └─ task_add_to_ready(L)
-      │       │           L.state = TASK_READY
-      │       │           → ready_lists[L.priority]
-      │       └─ port_clear_tick()
-      ├─ 选择最高优先级任务 (可能是刚唤醒的 L)
-      └─ port_switch_context() (如果需要)
+  └─ ... 稍后，某个任务调用 task_delay() / task_yield() / idle 轮询 ...
+       │
+       └─ schedule()
+           ├─ port_disable_interrupts()
+           ├─ if (port_tick_pending())
+           │   └─ process_tick()
+           │       ├─ tick_count++            // tick_count: N → N+1
+           │       ├─ 遍历 delayed_list
+           │       │   ├─ task_H: delay_ticks: 5→4 (未到期)
+           │       │   └─ task_L: delay_ticks: 1→0 (到期!)
+           │       │       ├─ list_remove(L 的 node)
+           │       │       └─ task_add_to_ready(L)
+           │       │           L.state = TASK_READY
+           │       │           → ready_lists[L.priority]
+           │       └─ port_clear_tick()
+           ├─ port_enable_interrupts()
+           └─ schedule_select_and_switch()   // 选任务 + 切换
 ```
+
+> **Unix 真抢占路径**见 §10.4 — tick 在 ISR 中直接处理，`schedule()` 只清除残留标志。
 
 ### 10.4 ISR 真抢占路径 (Phase 7)
 
@@ -1701,7 +1927,1000 @@ Task A (task_a_func 运行中)
 
 ---
 
-## 11. 与 FreeRTOS 的对比
+## 11. Phase 9：可变 Tick 间隔 + 毫秒级延时
+
+### 推荐先读这些文件
+
+> `port.c` (可变 tick API) → `task.c` (task_delay_ms) → `demo_tick_rate.c`
+
+### 11.1 为什么需要可变 Tick 间隔？
+
+不同应用场景对系统节拍有截然不同的需求：
+
+| 场景 | Tick 间隔 | 频率 | 原因 |
+|------|----------|------|------|
+| 环境监测 | 500ms～1s | 1～2Hz | 温度/湿度变化慢，低功耗优先 |
+| 小车巡线 | 10ms | 100Hz | 实时控制，需快速响应传感器 |
+| 通用嵌入式 | 10ms | 100Hz | 大多数场景的平衡点 |
+| 高精度控制 | 1ms | 1000Hz | 伺服电机、PID 控制等 |
+
+**核心理念**：硬件只有一个 SysTick（或 `setitimer`），通过 `kernel_set_tick_interval_ms()` 直接把想要的间隔写入定时器寄存器。定时器到时间就触发中断，CPU 处理 tick → 调度 → 回到任务。整个过程中硬件自动运行，不消耗 CPU 指令。
+
+### 11.2 API 设计
+
+```c
+/* kernel.h — 推荐: 毫秒级 API */
+void     kernel_set_tick_interval_ms(uint32_t ms);  // 1~1000ms
+uint32_t kernel_get_tick_interval_ms(void);         // 当前间隔 (ms)
+
+/* task.h — 毫秒级延时 */
+void task_delay_ms(uint32_t ms);  // 与 tick 间隔解耦, 始终是真实毫秒
+```
+
+**设计原理图和调用链**：
+
+```
+用户任务                          内核                         硬件
+────────                          ────                         ────
+task_delay_ms(100)               
+  │                               
+  ├─ ticks = (100ms * hz)/1000    
+  │   (一次乘除, ~3 CPU cycles)    
+  │                               
+  └─→ task_delay(ticks)           
+        │                         
+        ├─ 当前任务 → BLOCKED      
+        ├─ 加入 delayed_list      
+        └─ schedule() → 切换任务   
+                                    │
+                                    │  ┌─────────────────────────┐
+                                    │  │ SysTick 计数器          │
+                                    │  │ 每个 CPU 时钟周期减 1   │
+                                    │  │ 减到 0 → 触发中断       │
+                                    │  │ 硬件自动重装 LOAD 值    │
+                                    │  └─────────────────────────┘
+                                    │
+                              process_tick()
+                                ├─ tick_count++
+                                ├─ 遍历 delayed_list
+                                ├─ delay_ticks--
+                                └─ 到期 → 唤醒任务
+```
+
+### 11.3 `kernel_set_tick_interval_ms()` 的实现
+
+```c
+/* port.c — 跨平台统一 API, 内部委托给 kernel_set_tick_rate() */
+void kernel_set_tick_interval_ms(uint32_t ms)
+{
+    if (ms < 1 || ms > 1000) return;
+    kernel_set_tick_rate(1000 / ms);  // 毫秒 → 频率换算
+}
+
+/* 底层实现 (Unix 版本) */
+void kernel_set_tick_rate(uint32_t hz)
+{
+    if (hz < 1 || hz > 1000) return;
+
+    port_disable_interrupts();     // 临界区保护
+    g_tick_rate_hz = hz;           // 更新全局变量
+
+    if (scheduler_running) {
+        struct itimerval timer;
+        uint32_t interval_us = 1000000 / hz;   // 频率 → 微秒
+
+        timer.it_value.tv_sec     = interval_us / 1000000;
+        timer.it_value.tv_usec    = interval_us % 1000000;
+        timer.it_interval.tv_sec  = interval_us / 1000000;
+        timer.it_interval.tv_usec = interval_us % 1000000;
+
+        setitimer(ITIMER_REAL, &timer, NULL);  // 直写硬件定时器
+        port_clear_tick();                      // 清除旧频率残留
+    }
+
+    port_enable_interrupts();
+}
+```
+
+**关键设计点**：
+
+1. **`port_disable_interrupts()`**：修改全局变量 `g_tick_rate_hz` 和硬件定时器时需要临界区保护，防止 SIGALRM 在中间打断
+2. **`scheduler_running` 检查**：调度器启动前只设全局变量，`kernel_start()` 调用 `port_init_tick_timer()` 时读取并生效
+3. **`port_clear_tick()`**：切换间隔后清除旧频率下可能残留的 tick_pending 标志，防止一次旧 tick 触发多余调度
+4. **Windows 无额外操作**：tick 线程每循环重新读取 `g_tick_rate_hz`，自动适配新间隔
+
+### 11.4 `task_delay_ms()` — 与 Tick 间隔解耦
+
+这是整个设计的核心价值。对比两种写法：
+
+```c
+/* 旧写法: 依赖 tick 间隔, 换间隔后行为变化 */
+kernel_set_tick_interval_ms(10);
+task_delay(5);    // 5 ticks × 10ms = 50ms  ✓
+
+kernel_set_tick_interval_ms(500);
+task_delay(5);    // 5 ticks × 500ms = 2500ms  ← 完全变了!
+
+/* 新写法: 与 tick 间隔无关, 始终是真实毫秒 */
+kernel_set_tick_interval_ms(10);
+task_delay_ms(50);   // 50ms ✓ (内核换算为 5 ticks)
+
+kernel_set_tick_interval_ms(500);
+task_delay_ms(50);   // 50ms ✓ (内核换算为 1 tick, 向上取整)
+```
+
+**换算精度**：ms→tick 转换有取整。例如 tick 间隔=10ms 时，`task_delay_ms(15)` = ceil(15/10) = 2 ticks = 20ms。这是固定 tick 间隔的固有特性——延时精度等于 tick 间隔。
+
+### 11.5 Demo: 同一系统内热切换 Tick 间隔
+
+`demo_tick_rate.c` 展示两个场景在同一个 RTOS 实例中先后运行：
+
+```
+Phase 1: kernel_set_tick_interval_ms(500)
+         → 环境监测模式, 每 500ms 采样一次
+         → task_delay_ms(500) = 1 tick
+         → 5 ticks ≈ 2.5 秒完成采样
+
+Phase 2: kernel_set_tick_interval_ms(10)    ← 运行时热切换!
+         → 小车巡线模式, 每 50ms 控制一次
+         → task_delay_ms(50) = 5 ticks
+         → 60 ticks ≈ 0.6 秒到达终点
+```
+
+运行：
+```bash
+make clean && make DEMO=demo_tick_rate && ./build/lite_rtos_demo
+```
+
+关键观察：
+- Phase 1 中 tick 每 500ms 递增一次（慢速打印）
+- Phase 2 中 tick 每 10ms 递增一次（快速打印）
+- `task_delay_ms()` 在两种间隔下都传递相同的毫秒参数，行为一致
+- 寄存器一致性验证全部通过 ✓
+
+### 11.6 硬件层面：SysTick 的工作原理
+
+在 ARM Cortex-M 上，整个 tick 机制就靠一个 24 位递减计数器：
+
+```
+每个 CPU 时钟周期:  SysTick->LOAD 减 1
+减到 0 时:         触发 SysTick 异常 (中断)
+                   硬件自动重装 LOAD 值
+                   继续递减...
+
+软件只做了一件事: 在初始化时写一次 LOAD 值。
+之后完全由硬件自治运行，零软件开销。
+```
+
+```c
+// lite_rtos_oncar/port.c (ARM 实现)
+reload = (SystemCoreClock / g_tick_rate_hz) - 1;
+SysTick->LOAD = reload;   // 一次寄存器写, <1ns
+```
+
+**SysTick 的限制**：24 位计数器最大值 = 16,777,215。在 480MHz STM32H743 上，单次最大间隔 ≈ 35ms。想设 500ms 间隔需要预分频器（8 分频后 = 60MHz → 最大 ~280ms），或者换用 32 位通用定时器。
+
+### 11.7 Tick 间隔 vs 固定 Tick + 时间 API — 两种思路对比
+
+本节顺带讨论一个常见的 RTOS 设计问题：
+
+| | 可变 Tick 间隔 | 固定 Tick + 时间 API |
+|---|---|---|
+| 做法 | 改硬件定时器间隔 | 硬件固定高速 tick，软件换算时间 |
+| 省电 | ✅ 低 tick 频率减少 ISR 次数 | ❌ ISR 始终高频 |
+| `task_delay()` 语义 | 不稳定（取决于当前间隔） | 永远稳定 |
+| 最低延时粒度 | 随间隔变化 | 固定（通常 1ms） |
+| 适用场景 | 低功耗嵌入式设备 | 通用 RTOS |
+| Lite RTOS 中 | `kernel_set_tick_interval_ms()` | `task_delay_ms()` |
+
+**两者并存，各司其职**：`kernel_set_tick_interval_ms()` 管硬件（按需省电），`task_delay_ms()` 管软件（语义稳定）。这是本项目的设计选择。
+
+---
+
+---
+
+## 12. Phase 10：任务数量上限控制
+
+### 推荐先读这些文件
+
+> `kernel.h` (MAX_TASKS, API 声明) → `kernel.c` (全局变量 + setter/getter) → `task.c` (task_create 中的检查)
+
+### 12.1 为什么需要任务数量上限？
+
+在之前的代码中，`kernel.h` 定义了 `#define MAX_TASKS 16`，但 `task_create()` **从未真正检查**这个值——它只是 `malloc` 然后加入就绪链表，对已创建的任务数毫无感知。这意味着在一个 buggy 的循环中，理论上可以创建成千上万个任务，耗尽所有堆内存。
+
+解决方案分两层：
+1. **编译期默认值**：`MAX_TASKS 16` 作为默认上限
+2. **运行时可变**：通过 API 在程序启动后动态调整上限，无需重新编译
+
+### 12.2 API 设计
+
+```c
+/* kernel.h — 运行时可变的任务数量上限 */
+
+/* 设置最大任务数 (>=1, 已创建的任务不受影响) */
+void     kernel_set_max_tasks(uint32_t max);
+
+/* 获取当前最大任务数 */
+uint32_t kernel_get_max_tasks(void);
+
+/* 获取当前已创建的任务数 (不含 idle 任务) */
+uint32_t task_get_count(void);
+```
+
+**设计原则**：
+- `kernel_set_max_tasks()` 只约束**后续**的 `task_create()`，已创建的任务不受影响
+- 下限保护：`max < 1` 时自动设为 1，至少允许一个用户任务
+- idle 任务不计入 `g_task_count`——它是系统任务，始终存在
+
+### 12.3 实现细节
+
+**全局变量** ([kernel.c](kernel.c))：
+
+```c
+uint32_t  g_max_tasks  = MAX_TASKS;  /* 运行时最大任务数 (可通过 API 修改) */
+uint32_t  g_task_count = 0;          /* 当前已创建的任务数 (不含 idle) */
+```
+
+**setter/getter** ([kernel.c](kernel.c))：
+
+```c
+void kernel_set_max_tasks(uint32_t max)
+{
+    if (max < 1) {
+        max = 1;  /* 下限保护: 至少允许 1 个用户任务 */
+    }
+    g_max_tasks = max;
+}
+
+uint32_t kernel_get_max_tasks(void)
+{
+    return g_max_tasks;
+}
+
+uint32_t task_get_count(void)
+{
+    return g_task_count;
+}
+```
+
+**task_create() 中的检查** ([task.c](task.c))：
+
+```c
+tcb_t *task_create(void (*task_func)(void),
+                   const char *name,
+                   uint32_t stack_size,
+                   uint8_t priority)
+{
+    /* 参数检查 */
+    if (task_func == NULL) { ... return NULL; }
+    if (priority >= MAX_PRIORITIES) { ... return NULL; }
+
+    /* ★ 新增: 任务数量上限检查 */
+    if (g_task_count >= g_max_tasks) {
+        fprintf(stderr, "task_create: task count %u reached limit %u\n",
+                g_task_count, g_max_tasks);
+        return NULL;
+    }
+
+    /* ... 分配 TCB、栈、初始化 context、加入就绪列表 ... */
+
+    g_task_count++;  /* ★ 创建成功，递增计数 */
+
+    return task;
+}
+```
+
+**检查的插入位置**放在参数校验之后、`malloc` 之前——在分配任何内存之前就拒绝，避免半创建失败时的资源泄漏。
+
+### 12.4 使用示例
+
+```c
+// 读取默认上限
+printf("Max tasks: %u\n", kernel_get_max_tasks());  // 16
+
+// 运行时设为仅允许 3 个任务
+kernel_set_max_tasks(3);
+
+tcb_t *t1 = task_create(func1, "task_a", 4096, 1);  // ✓ (1/3)
+tcb_t *t2 = task_create(func2, "task_b", 4096, 1);  // ✓ (2/3)
+tcb_t *t3 = task_create(func3, "task_c", 4096, 1);  // ✓ (3/3)
+tcb_t *t4 = task_create(func4, "task_d", 4096, 1);  // ✗ 返回 NULL, 输出 "reached limit 3"
+
+printf("Current tasks: %u\n", task_get_count());    // 3
+```
+
+### 12.5 ARM Cortex-M7 上任务上限的实际制约
+
+`MAX_TASKS` 是软件限制，Cortex-M7 硬件本身不规定任务数量上限。但在实际嵌入式系统中，真正的制约来自以下因素：
+
+#### ① SRAM (内存) — 主导因素
+
+每个任务消耗的内存 = TCB 大小 + 栈大小。
+
+| 组件 | 典型大小 |
+|------|---------|
+| TCB (`tcb_t`) | ~100–200 字节 |
+| 任务栈 (简单任务) | 512 字节 – 2KB |
+| 任务栈 (复杂任务) | 2KB – 8KB+ |
+
+例如 STM32H743 (1MB SRAM) 上：
+- 10 个任务 × 2KB 栈 + 10 × 200B TCB = **~22KB** — 非常宽裕
+- 100 个任务 × 1KB 栈 + 100 × 200B TCB = **~120KB** — 仍有空间但接近极限
+
+**在 RAM 耗尽之前，`MAX_TASKS` 就应该阻止新任务创建。** 一个创建泄漏的 bug（如循环中不断 `task_create`）在几秒内就会吃光 RAM。设置 `kernel_set_max_tasks(N)` 相当于给你的堆加上"熔断器"——不等 RAM 耗尽，内核先拒绝。
+
+#### ② MPU 区域数 — 硬件硬限制
+
+Cortex-M7 的 MPU (Memory Protection Unit) 通常有 **8 或 16 个区域**。如果使用 MPU 为每个任务做内存隔离（防止任务 A 访问任务 B 的栈），每个受保护任务占用一个 MPU 区域。此时 MPU 区域数就是绝对上限：
+
+```
+如果你有 8 个 MPU 区域，最多只能保护 8 个任务。
+(实际上更少，因为系统区域、外设区域也会占用)
+```
+
+**不启用 MPU 则不受此限制。**
+
+#### ③ 调度器时间复杂度
+
+当前调度器 `find_highest_priority_task()` 的实现：
+
+```c
+for (int prio = 0; prio < MAX_PRIORITIES; prio++) {
+    if (!list_is_empty(&ready_lists[prio])) {
+        return list_entry(list_first(&ready_lists[prio]), tcb_t, node);
+    }
+}
+```
+
+时间复杂度 O(MAX_PRIORITIES) = O(8) ≈ O(1)，**与任务数量无关**。查找始终是扫描固定 8 个链表头。
+
+但 `process_tick()` 中：
+```c
+list_for_each_safe(node, tmp, &delayed_list) {
+    task->delay_ticks--;
+    if (task->delay_ticks == 0) { /* 唤醒 */ }
+}
+```
+
+时间复杂度 O(延时任务数)。如果 50 个任务同时延时，每个 tick 要遍历 50 次。在 480MHz M7 上，50 次遍历 + 递减 = 约 1μs，通常不构成瓶颈。
+
+#### ④ 上下文切换开销
+
+每次 `swapcontext` (或 ARM 上的 PendSV) 的耗时是**固定**的：
+
+| 操作 | 典型耗时 (Cortex-M7 @ 480MHz) |
+|------|-------------------------------|
+| 保存 R4-R11 | ~200ns |
+| 恢复 R4-R11 | ~200ns |
+| 切换栈指针 (PSP) | ~5ns |
+| **总计** | **~1–3μs** |
+
+切换开销不随任务总数增加。但任务越多 → 调度越频繁 → 切换总次数增加。这是间接影响。
+
+#### ⑤ 实际经验数据
+
+FreeRTOS 在 Cortex-M7 上的典型应用：
+
+| 应用类型 | 任务数 | 原因 |
+|---------|--------|------|
+| 简单传感器节点 | 3–5 | 采样、通信、管理 |
+| 智能小车 | 5–10 | 巡线、避障、电机控制、通信、状态管理 |
+| 工业控制器 | 10–20 | 多通道采样、多级控制、通信协议栈、安全监控 |
+| 复杂 IoT 网关 | 15–30 | 协议栈任务、云通信、本地存储、多传感器融合 |
+| 极端情况 | 30+ | 需要仔细审查栈使用量和 RAM 预算 |
+
+**建议**：对一个典型的 M7 项目，`kernel_set_max_tasks(16)` 是合理起点。如果确实需要更多，先审查以下事项：
+
+1. **SRAM 剩余**：计算 `Σ(栈大小ᵢ + sizeof(tcb_t))`，确保有 20%+ 余量
+2. **栈使用量分析**：每个任务的栈到底用了多少？可以用栈填充模式 (`0xDEADBEEF`) 统计
+3. **MPU 预算**：如果启用 MPU，留够区域数
+4. **调度延迟分析**：用逻辑分析仪或 DWT 周期计数器测量最坏情况下的调度延迟
+
+一句话总结：**SRAM 是你的实际上限，`MAX_TASKS` 是防止代码写坏的保护网。**
+
+### 12.6 学习检查点
+
+运行验证：
+```bash
+make clean && make DEMO=demo_task_create && ./build/lite_rtos_demo
+```
+
+应该看到：
+```
+[kernel] Task 'sensor' created: priority=1, stack=8192 bytes
+[kernel] Task 'display' created: priority=3, stack=8192 bytes
+[kernel] Task 'comm' created: priority=3, stack=8192 bytes
+[kernel] Task 'storage' created: priority=5, stack=8192 bytes
+[kernel] 已创建 4 个用户任务 + 1 个 idle 任务
+```
+
+尝试在代码中调用 `kernel_set_max_tasks(2)` 后创建更多任务，验证超限拒绝。
+
+---
+
+---
+
+## 13. Phase 11：计数信号量 (Counting Semaphore)
+
+### 推荐先读这些文件
+
+> `sem.h` → `sem.c` → `demo_sem.c`
+
+### 13.1 为什么需要信号量？
+
+`task_delay()` 只能让任务**按时间**阻塞——"等我 50ms"。但 RTOS 中更常见的需求是**按条件**阻塞：
+
+- "等红外传感器数据就绪"
+- "等 IMU 加速度数据到达"
+- "等电机控制计算完成"
+- "等某个外设空闲"
+
+这些场景的共同点是：**阻塞时长不确定，取决于另一个任务何时完成工作**。`task_delay()` 做不到这一点——你无法提前知道数据何时就绪。
+
+信号量 (Semaphore) 是最基础的同步原语，解决的就是"任务间按条件等待"的问题。它由两个要素组成：
+
+```
+信号量 = 一个计数器 (count) + 一个等待队列 (wait_list)
+
+  count > 0  →  资源可用，take 立即返回
+  count == 0 →  资源被占满，take 的任务排队等待
+  give 时    →  有排队者就唤醒队首，没有就 count++
+```
+
+### 13.2 信号量结构的内存布局
+
+[sem.h](sem.h) 中的 `sem_t` 非常紧凑——只有 8 个字节（不算链表的哨兵节点）：
+
+```c
+typedef struct {
+    int     count;       /* 可用资源计数 (>= 0) */
+    list_t  wait_list;   /* 阻塞在此信号量上的任务队列 (FIFO) */
+} sem_t;
+```
+
+其中 `list_t` 就是一个哨兵节点（`list_node_t sentinel`），含 `next` 和 `prev` 两个指针。信号量的全部工作就是在这条链表上增删任务的 `node` 成员：
+
+```
+信号量 sem_a_data (初始 count = 0):
+
+  wait_list:
+    ┌──────────────┐
+    │   sentinel   │
+    │ next ────────┼──→ 自己  (空链表)
+    │ prev ────────┼──→ 自己
+    └──────────────┘
+  count = 0
+
+当 Task B 调用 sem_take(&sem_a_data) 但 count == 0 时:
+
+  wait_list:
+    ┌──────────┐     ┌──────────────────────┐
+    │ sentinel │←───→│  Task B 的 node 成员   │
+    └──────────┘     │  (嵌入在 B 的 TCB 中)  │
+                     └──────────────────────┘
+  count = 0  (仍为 0，B 在排队)
+
+当 Task A 调用 sem_give(&sem_a_data) 时:
+
+  wait_list:
+    ┌──────────┐
+    │ sentinel │  (恢复为空)
+    └──────────┘
+  count = 0  (令牌直接转交给 B，count 不变)
+
+  Task B 已通过 task_add_to_ready() 回到 ready_lists[B.priority]。
+```
+
+这和 FreeRTOS 的 `xSemaphore` 结构完全一致：侵入式链表串起所有等待者，节点嵌入在 TCB 内部，不额外分配内存。
+
+### 13.3 全部 API
+
+```c
+/* kernel.h → sem.h — 计数信号量 API */
+
+void sem_init(sem_t *sem, int initial_count);   /* 初始化信号量, 设 count 初值 */
+void sem_take(sem_t *sem);                      /* 阻塞获取: count-- 或排队等待 */
+int  sem_try_take(sem_t *sem);                  /* 非阻塞尝试: 成功返回 1, 失败返回 0 */
+void sem_give(sem_t *sem);                      /* 释放 (任务上下文), 可能触发调度 */
+void sem_give_from_isr(sem_t *sem);             /* 释放 (ISR 上下文), 不调 schedule */
+```
+
+5 个 API，总计约 90 行实现代码。核心只有两个函数：`sem_take`（获取）和 `sem_give`（释放），其余是辅助。
+
+### 13.4 `sem_init()` — 初始化
+
+```c
+void sem_init(sem_t *sem, int initial_count)
+{
+    sem->count = initial_count;
+    list_init(&sem->wait_list);  /* sentinel.next = sentinel.prev = &sentinel */
+}
+```
+
+在调度器启动**之前**调用（通常紧接 `kernel_init()` 之后）。此时没有中断、没有并发，无需临界区保护。
+
+`initial_count` 的含义：
+
+| initial_count | 语义 | 典型用途 |
+|---------------|------|----------|
+| 0 | 资源初始不可用，消费者需等待生产者 | 数据就绪通知 |
+| 1 | 二值信号量 (Binary Semaphore)，互斥 | 保护共享资源 |
+| N (>1) | 计数信号量，N 份相同资源可用 | 管理缓冲池、外设通道 |
+
+Demo 中使用 `sem_init(&sem_a_data, 0)` — 初始无数据，消费者必须等待生产者先 `give`。
+
+### 13.5 `sem_take()` — 阻塞获取（逐行详解）
+
+[sem.c](sem.c) 的 `sem_take()` 是整个信号量模块最核心的函数。它有两条完全不同的执行路径，取决于 `count` 的值：
+
+```c
+01: void sem_take(sem_t *sem)
+02: {
+03:     port_disable_interrupts();           // ← ① 临界区开始
+04:
+05:     /* ═══════════ 快路径: 资源可用 ═══════════ */
+06:     if (sem->count > 0) {
+07:         sem->count--;                    // ← ② 递减 count, 取走令牌
+08:         port_enable_interrupts();        // ← ③ 临界区结束
+09:         return;                          // ← ④ 立即返回, 不阻塞!
+10:     }
+11:
+12:     /* ═══════════ 慢路径: 资源不可用, 阻塞 ═══════════ */
+13:     task_remove_from_ready(current_task);  // ← ⑤ 离开就绪链表
+14:     current_task->state = TASK_BLOCKED;    // ← ⑥ 标记阻塞态
+15:     list_insert_tail(&sem->wait_list,      // ← ⑦ 挂到信号量等待队列
+16:                      &current_task->node);
+17:
+18:     port_enable_interrupts();              // ← ⑧ 临界区结束
+19:     schedule();                            // ← ⑨ 让出 CPU!
+20:
+21:     /* ★ 被 sem_give 唤醒后从此处继续执行 ★
+22:      * 令牌已由 sem_give 直接转移给本任务,
+23:      * 无需递减 count — 直接 return 即可。 */
+24: }
+```
+
+#### 逐行解读
+
+**第 3 行 — `port_disable_interrupts()`**：进入临界区。在修改 `count` 和操作链表的整个过程中，必须屏蔽中断（Unix 上是 SIGALRM），防止 tick ISR 在操作中途插入并破坏数据结构。
+
+**第 6-10 行 — 快路径**：如果 `count > 0`（资源池里有令牌），直接拿走一个令牌（`count--`），开中断，返回。整条路径零阻塞、零上下文切换。这是最常见的路径——生产者已经 `give` 过，消费者来了直接取走。
+
+**第 13 行 — `task_remove_from_ready(current_task)`**：把当前任务从 `ready_lists[priority]` 中摘除。此时 `current_task` 不再是就绪态，调度器不会再选中它。函数实现：
+
+```c
+void task_remove_from_ready(tcb_t *task) {
+    if (task == NULL) return;
+    list_remove(&task->node);  // O(1) 删除, 不需要知道属于哪个链表
+}
+```
+
+**第 14 行 — `current_task->state = TASK_BLOCKED`**：标记为阻塞态。`schedule_select_and_switch()` 中有一个关键判断：如果 `prev->state == TASK_RUNNING` 则改为 `TASK_READY`。但 `TASK_BLOCKED` 不会被改回 `READY`——这确保了任务直到被显式唤醒才可能被调度。
+
+**第 15-16 行 — `list_insert_tail()`**：把当前任务的 `node` 成员插入信号量等待队列的尾部（FIFO）。这是一个纯指针操作——修改 `node->prev`、`node->next` 以及邻居节点的指针，不涉及任何内存分配。
+
+**第 19 行 — `schedule()`**：这是关键一步——主动让出 CPU。调度器会：
+1. 再次关中断 → 处理 tick（如有）
+2. 调用 `find_highest_priority_task()` 扫描就绪链表
+3. 找到最高优先级的就绪任务（当前任务已不在任何就绪链表中）
+4. 通过 `swapcontext()` 切换到那个任务
+
+当前任务在此"冻结"——它的执行上下文（RSP、RIP、所有寄存器）被保存在 `current_task->context` 中，下次被唤醒时从第 21 行继续。
+
+**第 21 行以后 — 被唤醒后的继续点**：当另一个任务调用 `sem_give()` 并从 `wait_list` 中弹出当前任务、调用 `task_add_to_ready()` 将它放回就绪链表，最终调度器选中它时，执行从 `schedule()` 调用之后继续——就像 `schedule()` 只是一个"耗时很长的函数"。
+
+#### 令牌转移机制
+
+这是信号量设计中最精妙的部分。被唤醒后**为什么不需要递减 `count`**？
+
+因为令牌的转移发生在 `sem_give` 端：
+
+```
+场景 A: sem_give 时无人等待
+  sem_give() → count++                   (令牌暂存在 count 里)
+  sem_take() → count-- → return          (后来者从 count 取走令牌)
+
+场景 B: sem_give 时有人等待
+  sem_give() → pop wait_list → task_add_to_ready  (令牌直接转交)
+  sem_take() → 被唤醒, 直接 return                (令牌已在自己手里)
+
+关键: 场景 B 中 count 始终为 0, 令牌从未经过 count 字段。
+      "唤醒"这个动作本身就是令牌的转移。
+```
+
+如果在被唤醒后再递减 `count`，就相当于**拿了两个令牌**——一个通过"被唤醒"拿到，一个通过"递减 count"拿到。而 `count` 可能已经是 0（场景 B），减去后变成 -1，彻底破坏了信号量的不变量（`count >= 0`）。
+
+### 13.6 `sem_give()` — 释放信号量（逐行详解）
+
+```c
+01: void sem_give(sem_t *sem)
+02: {
+03:     tcb_t *woken = NULL;                 // ← ① 记录被唤醒的任务
+04:
+05:     port_disable_interrupts();           // ← ② 临界区开始
+06:
+07:     if (!list_is_empty(&sem->wait_list)) {
+08:         /* ═════ 有等待者: 唤醒队首 (FIFO) ═════ */
+09:         list_node_t *node = list_pop_head(&sem->wait_list);
+10:                                          // ← ③ 弹出队首, O(1)
+11:         woken = list_entry(node, tcb_t, node);
+12:                                          // ← ④ 反查 TCB 指针
+13:         task_add_to_ready(woken);        // ← ⑤ 放回就绪链表
+14:     } else {
+15:         /* ═════ 无等待者: count++ ═════ */
+16:         sem->count++;                    // ← ⑥ 令牌暂存
+17:     }
+18:
+19:     port_enable_interrupts();            // ← ⑦ 临界区结束
+20:
+21:     /* ★ 仅当唤醒任务优先级更高时才触发调度 ★ */
+22:     if (woken != NULL && woken->priority < current_task->priority) {
+23:         schedule();                      // ← ⑧ 条件调度
+24:     }
+25: }
+```
+
+#### 逐行解读
+
+**第 3 行 — `woken = NULL`**：这是关键变量，记录了"本次 give 是否唤醒了一个任务"。初始为 `NULL`，只在有等待者时被赋值。
+
+**第 7 行 — `list_is_empty(&sem->wait_list)`**：判断等待队列是否有任务在排队。这是一个 O(1) 操作——只比较 `sentinel.next == &sentinel`。
+
+**第 9-13 行 — 有等待者路径**：
+
+- `list_pop_head()` 做了两件事：取出队首节点 + 把它从链表中移除。O(1)。
+- `list_entry(node, tcb_t, node)` 用 `container_of` 宏从 `node` 的地址减去 `node` 在 `tcb_t` 中的偏移量，得到整个 TCB 的指针。详见 §3.2。
+- `task_add_to_ready(woken)` 做了三件事：
+  1. `woken->state = TASK_READY` — 改状态
+  2. `list_insert_tail(&ready_lists[woken->priority], &woken->node)` — 挂回就绪链表
+  3. 此后调度器的 `find_highest_priority_task()` 就能看到这个任务了
+
+**第 14-16 行 — 无等待者路径**：简单递增 `count`。未来某个任务调用 `sem_take()` 时走快路径直接取走。
+
+**第 22-24 行 — 条件调度**：这是 Lite RTOS 信号量实现的一个关键设计决策。`schedule()` 不是无条件调用的。
+
+```c
+if (woken != NULL && woken->priority < current_task->priority) {
+    schedule();
+}
+```
+
+条件有二：① 确实唤醒了一个任务；② 被唤醒任务的优先级**数值上小于**（即优先级更高）当前任务。两个条件同时满足才触发调度。
+
+**为什么加这个限制？** 考虑 Demo 中的场景：
+
+```
+Task A "IR"  (prio 0, 最高) 调用 sem_give()
+  → 唤醒 Task B "Obst" (prio 2)
+  → 如果立即 schedule(), 切到 B (prio 2)
+  → 但 A (prio 0) 比 B 更紧急! A 不应该被 B 抢占!
+```
+
+不加优先级检查的话，高优先级任务每 `give` 一次就被切走——即使切向的是一个更低优先级的任务。这既不合理（违反优先级调度原则），也低效（额外的上下文切换开销）。
+
+加了检查后：A(prio 0) 给 B(prio 2) 发信号 → 不切 → A 继续执行完当前周期 → A 最后调用 `task_delay_ms(50)` → `schedule()` → 此时 A 已阻塞，B 成为最高就绪任务 → 切到 B。
+
+反之，如果一个**低优先级任务**（如 prio 4）give 给一个**高优先级任务**（如 prio 0）：
+
+```
+Task C "Motor" (prio 3) 调用 sem_give()
+  → 唤醒 Task A "IR" (prio 0)
+  → woken->priority (0) < current_task->priority (3)  ✅ 满足!
+  → schedule() → 立即切换到 A!
+  → A 是高优任务, 应该立刻运行 ✔
+```
+
+这就是"条件调度"的精髓：**只有更高优先级的任务被唤醒时才值得立即切换。**
+
+### 13.7 `sem_try_take()` — 非阻塞获取
+
+```c
+int sem_try_take(sem_t *sem)
+{
+    port_disable_interrupts();
+
+    if (sem->count > 0) {
+        sem->count--;                 /* 令牌到手 */
+        port_enable_interrupts();
+        return 1;                     /* 成功 */
+    }
+
+    port_enable_interrupts();
+    return 0;                         /* 资源不可用, 不阻塞 */
+}
+```
+
+和 `sem_take` 的区别只有一点：**没有慢路径**。`count == 0` 时不排队、不阻塞，直接返回 0。调用者自行决定是放弃、重试还是做别的。
+
+典型用法：
+
+```c
+/* 检查数据是否就绪, 不就绪则跳过本轮处理 */
+if (sem_try_take(&sem_data)) {
+    process_data();
+} else {
+    /* 数据还没好, 先干别的 */
+    do_other_work();
+}
+```
+
+### 13.8 `sem_give_from_isr()` — ISR 上下文释放
+
+```c
+void sem_give_from_isr(sem_t *sem)
+{
+    port_disable_interrupts();
+
+    if (!list_is_empty(&sem->wait_list)) {
+        list_node_t *node = list_pop_head(&sem->wait_list);
+        tcb_t *woken = list_entry(node, tcb_t, node);
+        task_add_to_ready(woken);
+    } else {
+        sem->count++;
+    }
+
+    port_enable_interrupts();
+    /* ★ 不调用 schedule() — 由 ISR 框架统一调度 */
+}
+```
+
+和 `sem_give` 的唯一区别：**末尾没有 `schedule()` 调用**。
+
+原因在于调用上下文不同。`sem_give_from_isr` 预期在中断服务程序 (ISR) 中调用。在 Unix 平台上，SIGALRM 信号处理函数调用链是：
+
+```
+SIGALRM 触发
+  → tick_signal_handler()
+    → [用户代码可能调用 sem_give_from_isr()]
+    → schedule_from_isr()
+      → process_tick()            // 处理延时到期
+      → schedule_select_and_switch()  // ★ 这里统一调度!
+```
+
+如果 `sem_give_from_isr` 自己调了 `schedule()`，会发生**双重调度**——先在这里切一次，回到 ISR 框架后又切一次。不仅浪费，还可能导致状态错乱。
+
+所以 `sem_give_from_isr` 只负责"把任务放回就绪链表"，把"选谁运行"的决定留给 ISR 出口的 `schedule_from_isr()`。这是 FreeRTOS 中 `xSemaphoreGiveFromISR` 的标准模式。
+
+### 13.9 深入理解：令牌转移的三个时序
+
+理解信号量的关键是把 `count` 和 `wait_list` 看作**令牌的两种存储形式**：
+
+```
+count 是"暂存区" — 令牌暂时存在计数器里, 等下一次 take 取走
+wait_list 是"直达通道" — 令牌不经过 count, 直接交给等待者
+```
+
+以下是三个典型时序，覆盖所有可能的情况：
+
+**时序 1: 先生产后消费（count 暂存）**
+
+```
+时间 ──────────────────────────────────────────→
+
+Task A (生产者):    [init count=0]    sem_give()     ...
+                                         │
+                                    count 变成 1
+
+Task B (消费者):    ...                  (sleep)     sem_take()
+                                                       │
+                                                   count>0 → count=0
+                                                   快路径, 立即返回
+                                                   令牌从 count 转给 B
+```
+
+**时序 2: 先消费后生产（wait_list 直达）**
+
+```
+时间 ──────────────────────────────────────────→
+
+Task B (消费者):    sem_take()    ...        (blocked)
+                       │
+                  count==0 → 加入 wait_list
+                  让出 CPU
+
+Task A (生产者):    ...          sem_give()
+                                    │
+                              wait_list 非空 → pop B
+                              task_add_to_ready(B)
+                              令牌直达 B, count 仍为 0
+```
+
+**时序 3: 多消费者排队（FIFO 唤醒）**
+
+```
+Task B (prio 2) 和 Task C (prio 3) 都等待 sem_a_data:
+
+wait_list:  sentinel ←→ [B.node] ←→ [C.node] ←→ sentinel
+                         队首 ↑        队尾 ↑
+
+Task A 第一次 sem_give():
+  → list_pop_head() 弹出 B  ← FIFO! B 先到先得
+  → task_add_to_ready(B)     ← B 回到 ready_lists[2]
+  → B.priority(2) > A.priority(0)? 否 → 不切
+
+Task A 第二次 sem_give():
+  → list_pop_head() 弹出 C  ← C 还在排队
+  → task_add_to_ready(C)     ← C 回到 ready_lists[3]
+  → 不切
+
+Task A 最后 task_delay():
+  → schedule()
+  → find_highest_priority_task() 从 prio=0 扫描:
+      ready_lists[0] = 空 → 继续
+      ready_lists[1] = 空 → 继续
+      ready_lists[2] = [B] → 返回 B!
+  → swapcontext(A, B)  ← B 先运行 (优先级更高)
+  
+B 运行完 → task_delay → schedule() → 选 C (prio 3) → swapcontext(B, C)
+```
+
+注意：B 和 C 虽然都在 `ready_lists` 中，但**不是按 FIFO 顺序运行的**——一旦回到就绪链表，调度器的优先级扫描机制接管，B(prio 2) 优先于 C(prio 3)。信号量的 FIFO 只控制"谁先从等待队列被唤醒"，不管"唤醒后谁先运行"。
+
+### 13.10 Demo 全流程追踪
+
+以 [demo_sem.c](demo_sem.c) 的第一周期为例，追踪从启动到所有任务完成一次循环的完整过程。tick 间隔为 10ms。
+
+**阶段 0: 启动 (tick 0)**
+
+```
+kernel_start() → 选最高优先级就绪任务: IR (prio 0) → 切换到 IR
+
+IR 开始执行:    task_delay(1) → 阻塞 1 tick → 切到 IMU (prio 1)
+IMU 开始执行:   task_delay(1) → 阻塞 1 tick → 切到 Obst (prio 2)  
+Obst 开始执行:  sem_take(&sem_a_data) → count==0 → 阻塞, 加入 wait_list
+Motor 开始执行: sem_take(&sem_a_data) → count==0 → 阻塞, 加入 wait_list
+
+所有 4 个任务都阻塞! idle 任务运行。
+```
+
+此时链表快照：
+
+```
+ready_lists[0]: (空)
+ready_lists[1]: (空)  
+ready_lists[2]: (空)
+ready_lists[3]: (空)
+ready_lists[7]: [idle]                    ← 唯一就绪的任务
+
+delayed_list:   sentinel ←→ [IR.node(delay=1)] ←→ [IMU.node(delay=1)]
+
+sem_a_data.wait_list: sentinel ←→ [Obst.node] ←→ [Motor.node]
+sem_d_data.wait_list: (空)
+```
+
+**阶段 1: IR 苏醒, 生产数据 (tick 1-3)**
+
+```
+tick 1: process_tick() → IR.delay_ticks 归零 → task_add_to_ready(IR)
+        schedule_select_and_switch() → IR (prio 0) vs idle (prio 7) → 切到 IR
+
+IR:     [IR] step 2/3: reading ADC... → task_delay(1)
+
+tick 2: IR 又醒了 → [IR] step 3/3: computing distance...
+        → task_delay(1)
+
+tick 3: IR 又醒了 → [IR] ★ PRODUCED: ir_distance = 150
+        sem_give(&sem_a_data)  → 弹出 Obst, task_add_to_ready(Obst)
+        sem_give(&sem_a_data)  → 弹出 Motor, task_add_to_ready(Motor)
+        task_delay_ms(50)      → IR 休眠 50ms, schedule()!
+```
+
+调度器扫描：`ready_lists[0]=空, [1]=空, [2]=[Obst]` → 切到 Obst！
+
+**阶段 2: Obst 消费, 分析障碍物 (tick 3-5)**
+
+```
+Obst:   [Obst] got ir_distance=150, analyzing...
+        [Obst] step 1/2: threshold analysis... → task_delay(1)
+        
+tick 4: Obst 醒了 → [Obst] step 2/2: decision making... → task_delay(1)
+
+tick 5: Obst 醒了 → [Obst] ★ RESULT: clear (dist=150 >= 100)
+        task_delay_ms(20) → Obst 休眠 20ms → schedule()!
+```
+
+调度器扫描：`ready_lists[0]=空, [1]=空, [2]=空 (Obst 刚离开), [3]=[Motor]` → 切到 Motor！
+
+**阶段 3: Motor 第一次等待, IMU 第二次等待 (tick 5-6)**
+
+```
+Motor:  sem_take(&sem_a_data) → 快路径! count 还有令牌吗?
+```
+
+等等——A 给了两次 `sem_give`，第一次弹出 Obst（令牌直达），第二次弹出 Motor（令牌也直达）。Motor 已经不在 `sem_a_data.wait_list` 里了，它是在 `ready_lists[3]` 中被调度器选中的。Motor 在 `sem_take` 调用时，`count` 是 0，`wait_list` 是空的——两个 `sem_give` 都直接唤醒了等待者，没有经过 `count`。
+
+```
+Motor:  sem_take(&sem_a_data) → count==0 → 但 Motor 已经在 ready_lists 里了?
+```
+
+**不对**——让我重新追踪。Obst 和 Motor 都在 tick 0 调用了 `sem_take(&sem_a_data)`，都进了 `wait_list`。然后在 tick 3，A 调用了两次 `sem_give`：
+
+- 第一次 `sem_give`：`list_pop_head` 弹出 Obst → `task_add_to_ready(Obst)` → Obst 在 `ready_lists[2]`
+- 第二次 `sem_give`：`list_pop_head` 弹出 Motor → `task_add_to_ready(Motor)` → Motor 在 `ready_lists[3]`
+
+Obst 先运行（prio 2 > prio 3）。Obst 做完了自己的分析工作后 `task_delay_ms(20)`，调度器切到 Motor。Motor 已经在 `ready_lists[3]` 中，它之前调用的 `sem_take` 已经返回了（在 `schedule()` 之后继续执行）。所以 Motor 现在继续往下走：
+
+```
+Motor:  [Motor] got ir_distance=150, now waiting for IMU...
+        sem_take(&sem_d_data) → count==0, wait_list 空
+        → 这次真的要阻塞了! 加入 sem_d_data.wait_list → schedule()
+```
+
+调度器扫描：所有用户任务都阻塞了（IR 延时、IMU 延时、Obst 延时、Motor 在信号量等待）→ 切到 idle。
+
+**阶段 4: IMU 苏醒, 生产数据, Motor 被唤醒 (tick 6-8)**
+
+```
+tick 6: idle 运行...
+
+tick 7: process_tick() → IMU.delay_ticks 归零 → task_add_to_ready(IMU)
+        schedule_select_and_switch() → IMU (prio 1) → 切到 IMU
+
+IMU:    [IMU] ★ PRODUCED: accel=(+0.75, -0.02, +1.00)
+        sem_give(&sem_d_data) → wait_list 非空 → pop Motor!
+        → task_add_to_ready(Motor)
+        → Motor.priority(3) > IMU.priority(1)? 是，3>1 → 不切
+        task_delay_ms(70) → IMU 休眠 → schedule()
+
+调度器: ready_lists[3]=[Motor] → 切到 Motor!
+```
+
+**阶段 5: Motor 完成控制计算 (tick 8-11)**
+
+```
+Motor:  sem_take(&sem_d_data) 返回 (被 IMU 唤醒后从此处继续!)
+        [Motor] got IMU (ax=0.75, ay=-0.02), computing...
+        [Motor] step 1/3: sensor fusion... → task_delay(1)
+        
+tick 9: [Motor] step 2/3: PID computation... → task_delay(1)
+tick 10:[Motor] step 3/3: PWM output... → task_delay(1)
+tick 11:[Motor] ★ COMMAND: speed=80, steer=-0.3, PWM=(L:80, R:80)
+        task_delay_ms(30) → Motor 休眠
+
+第一周期完成! ✅
+```
+
+**关键观察总结**：
+
+| tick | 事件 | 阻塞机制 |
+|------|------|----------|
+| 0 | 四任务全部阻塞 | `sem_take` (Obst, Motor) + `task_delay` (IR, IMU) |
+| 1-3 | IR 生产数据, give ×2 | 两个 `sem_give` 唤醒 Obst 和 Motor |
+| 3-5 | Obst 分析, Motor 等 D | Obst 运行完; Motor 在 `sem_take(&sem_d_data)` 阻塞 |
+| 7-8 | IMU 生产数据, give | `sem_give` 唤醒 Motor |
+| 8-11 | Motor 完成计算 | 双信号量依赖满足, 输出控制指令 |
+
+### 13.11 与 `task_delay` 阻塞路径的完整对比
+
+```
+                    task_delay(N)               sem_take(sem)
+                    ────────────                ─────────────
+脱离就绪:           task_remove_from_ready      完全相同
+标记状态:           state = TASK_BLOCKED        完全相同
+等待队列:           全局 delayed_list           信号量私有的 wait_list
+附加信息:           delay_ticks = N             无
+让出 CPU:           schedule()                  完全相同
+唤醒者:             process_tick()              sem_give()
+唤醒操作:           list_remove + task_add      list_pop_head + task_add (更深奥)
+唤醒触发条件:       delay_ticks 减到 0          另一个任务调用 sem_give()
+```
+
+本质区别只有一个：**等时间 vs 等事件**。但内核的阻塞/唤醒基础设施是同一套代码。
+
+### 13.12 设计边界与限制
+
+**单节点约束**：TCB 只有一个 `list_node_t node`，调用 `sem_take` 慢路径时从 `ready_lists` 移入 `sem->wait_list`；调用 `task_delay` 时则需要移入 `delayed_list`。任务不能同时在两个等待队列中。这意味着**不支持带超时的信号量等待**——语义是"等信号量，最多等 N 个 tick"。要支持需要给 TCB 增加第二个 `list_node_t`。
+
+**FIFO 唤醒顺序**：`list_pop_head` 弹出最早排队的任务，不按优先级重排 `wait_list`。这保持简单，且在大多数场景下足够。FreeRTOS 默认也是 FIFO。
+
+**ISR 限制**：`sem_give_from_isr` 不调用 `schedule()`，要求在 ISR 出口处有统一的调度点。当前 SIGALRM 处理函数中的 `schedule_from_isr()` 满足此要求。如果在其他 ISR（如 GPIO）中使用，确保 ISR 框架包含 `schedule_from_isr()` 调用。
+
+**计数不能为负**：`sem_take` 的慢路径不递减 `count`（因为 `count` 已经是 0），`sem_give` 在无等待者时递增 `count`。`count` 始终 ≥ 0，这是代码不变量。
+
+---
+
+## 14. 与 FreeRTOS 的对比
 
 | 概念 | Lite RTOS | FreeRTOS |
 |------|-----------|----------|
@@ -1718,19 +2937,21 @@ Task A (task_a_func 运行中)
 | 空闲任务 | `idle_task` (自动创建) | `prvIdleTask` (自动创建) |
 | 上下文切换 | `swapcontext()` | PendSV 汇编 |
 | 临界区 | `port_disable_interrupts()` | `taskENTER_CRITICAL()` |
-| 系统节拍 | SIGALRM (100Hz) | SysTick (通常 1000Hz) |
+| 系统节拍 | SIGALRM (可设 1~1000ms) | SysTick (通常 1000Hz) |
+| Tick 间隔可配 | ✅ `kernel_set_tick_interval_ms()` | ❌ 仅编译期 `configTICK_RATE_HZ` |
+| `task_delay_ms()` | ✅ | ✅ `vTaskDelay(pdMS_TO_TICKS(ms))` |
 | 优先级位图 | ❌ (遍历 8 个优先级) | ✅ `uxTopReadyPriority` (O(1)) |
 | 时间片轮转 | ❌ | ✅ (同优先级按时间片) |
 | 互斥量 | ❌ | ✅ |
-| 信号量 | ❌ | ✅ |
+| 计数信号量 | ✅ `sem_t` (Phase 11) | ✅ |
 | 消息队列 | ❌ | ✅ |
 | 内存管理 | malloc/free | heap_1~heap_5 |
 
 ---
 
-## 12. 扩展方向
+## 15. 扩展方向
 
-### 12.1 优先级位图加速
+### 15.1 优先级位图加速
 
 当前 `find_highest_priority_task()` 每次扫描 8 个优先级。用位图只需一条 `__builtin_clz()` 指令：
 
@@ -1751,7 +2972,7 @@ static tcb_t *find_highest_priority_task(void) {
 }
 ```
 
-### 12.2 时间片轮转
+### 15.2 时间片轮转
 
 同优先级任务各执行 1 个 tick，然后自动切换到同优先级的下一个：
 
@@ -1764,44 +2985,23 @@ if (当前任务优先级有其他就绪任务 && 时间片用完) {
 }
 ```
 
-### 12.3 信号量 (Semaphore)
+### 15.3 消息队列 (Message Queue)
+
+信号量已作为 Phase 11 正式实现（见 §13），此处预留给下一阶段的消息队列：
 
 ```c
 typedef struct {
-    int count;              // 信号量计数
-    list_t wait_list;       // 等待此信号量的任务链表
-} semaphore_t;
-
-void sem_take(semaphore_t *sem) {
-    port_disable_interrupts();
-    if (sem->count > 0) {
-        sem->count--;
-    } else {
-        // 资源不可用：阻塞当前任务，加入等待链表
-        task_remove_from_ready(current_task);
-        current_task->state = TASK_BLOCKED;
-        list_insert_tail(&sem->wait_list, &current_task->node);
-        port_enable_interrupts();
-        schedule();  // 切换到其他任务
-    }
-    port_enable_interrupts();
-}
-
-void sem_give(semaphore_t *sem) {
-    port_disable_interrupts();
-    if (!list_is_empty(&sem->wait_list)) {
-        // 有任务在等待：唤醒等待队列中优先级最高的
-        list_node_t *n = list_pop_head(&sem->wait_list);
-        tcb_t *task = list_entry(n, tcb_t, node);
-        task_add_to_ready(task);  // 唤醒
-    } else {
-        sem->count++;
-    }
-    port_enable_interrupts();
-}
+    void   *buffer;       // 消息缓冲区
+    size_t  item_size;    // 每条消息大小
+    size_t  max_items;    // 最大消息数
+    size_t  read_idx;     // 读指针
+    size_t  write_idx;    // 写指针
+    sem_t   sem_rx;       // 接收信号量 (数据就绪通知)
+    sem_t   sem_tx;       // 发送信号量 (缓冲区空闲通知)
+} mqueue_t;
 ```
 
-### 12.4 ARM Cortex-M3 移植
+### 15.4 ARM Cortex-M3 移植
 
 替换 `port.c` 中的 ucontext 操作为：
 
@@ -1822,7 +3022,7 @@ PendSV_Handler:
     bx      lr                     /* 返回，硬件自动恢复 R0-R3,R12,LR,PC,xPSR */
 ```
 
-### 12.5 调试增强
+### 15.5 调试增强
 
 ```c
 // 打印所有任务状态 (调试神器)
@@ -1908,7 +3108,11 @@ make clean && make
 | 8 | `kernel.c` | `kernel_init()` → `kernel_start()` → `schedule()` → `process_tick()` → `schedule_from_isr()` |
 | 9 | `demo_preempt.c` | 看延迟抢占如何工作（Phase 6） |
 | 10 | `demo_preempt_true.c` | 看真抢占如何工作（Phase 7）— CPU 密集型任务被 ISR 强制切换 |
-| 11 | 全部重读一遍 | 第二次阅读会有全新的理解 |
+| 11 | `demo_tick_rate.c` | 看可变 tick 间隔 + 毫秒级延时（Phase 9） |
+| 12 | `sem.h` | 信号量类型与 API 声明（Phase 11） |
+| 13 | `sem.c` | 信号量实现——`sem_take` 复用 `task_delay` 的阻塞模式 |
+| 14 | `demo_sem.c` | 看计数信号量如何同步多任务数据流（Phase 11） |
+| 15 | 全部重读一遍 | 第二次阅读会有全新的理解 |
 
 ## 附录 C：常见面试/理解问题
 
@@ -1926,3 +3130,5 @@ make clean && make
 12. **为什么真抢占需要 sigprocmask 操作？** → 信号处理函数中 SIGALRM 被内核自动阻塞，不手动解阻塞的话切换到的任务无法再被抢占。详见 §9.4
 13. **Windows 上为什么没有真抢占？** → `SwitchToFiber()` 只能由拥有该 fiber 的线程调用，后台 tick 线程无法操作主线程的 fiber。详见 §9.9
 14. **schedule() 和 schedule_from_isr() 的区别？** → schedule() 在任务上下文中调用，自己负责开关中断；schedule_from_isr() 在 ISR 上下文中调用，额外管理信号掩码。详见 §9.3
+15. **`task_delay()` 和 `task_delay_ms()` 的区别？** → `task_delay(N)` 的参数是 tick 数，实际时间取决于 tick 间隔；`task_delay_ms(N)` 的参数是真实毫秒，与 tick 间隔解耦。推荐用后者。详见 §7.4b
+16. **为什么不用两个硬件定时器来实现"快慢两种 tick"？** → 不需要。固定一个高速 tick + `task_delay_ms()` 就能覆盖所有场景。相机等慢任务阻塞时 CPU 进入 WFI 睡眠，比降低 tick 频率更省电。两个定时器会显著增加复杂度且 PC 模拟器不支持。详见 §11.7

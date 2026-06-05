@@ -25,6 +25,8 @@ list_t    delayed_list;                       /* 延时任务链表 */
 tcb_t     idle_task_tcb;                      /* 空闲任务 TCB (静态分配) */
 uint32_t  tick_count = 0;                     /* 系统节拍计数 */
 uint8_t   scheduler_running = 0;              /* 调度器是否已启动 */
+uint32_t  g_max_tasks = MAX_TASKS;            /* 运行时最大任务数 (可通过 API 修改) */
+uint32_t  g_task_count = 0;                   /* 当前已创建的任务数 (不含 idle) */
 
 /* 空闲任务栈 */
 static uint8_t idle_stack[DEFAULT_STACK_SIZE];
@@ -352,4 +354,31 @@ void task_yield(void)
 
     port_enable_interrupts();
     schedule();
+}
+
+/* ====================================================================
+ *  任务数量上限 API (运行时可变)
+ *
+ *  设计要点:
+ *    - 最大值仅约束后续 task_create(), 已创建的任务不受影响
+ *    - 下限保护: 至少为 1 (保证 idle 任务有存在的空间)
+ *    - 当前实现中, idle 任务不计入 g_task_count
+ * ==================================================================== */
+
+void kernel_set_max_tasks(uint32_t max)
+{
+    if (max < 1) {
+        max = 1;  /* 下限保护: 至少允许 1 个用户任务 */
+    }
+    g_max_tasks = max;
+}
+
+uint32_t kernel_get_max_tasks(void)
+{
+    return g_max_tasks;
+}
+
+uint32_t task_get_count(void)
+{
+    return g_task_count;
 }

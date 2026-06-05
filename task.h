@@ -31,4 +31,17 @@ void task_remove_from_ready(tcb_t *task);
  */
 void task_delay(uint32_t ticks);
 
+/**
+ * 任务延时 — 毫秒版本 (推荐)
+ *
+ * 等同于 task_delay(), 但参数是真实毫秒数,
+ * 与当前 tick 间隔无关。内部自动换算为 tick 数。
+ *
+ * 例如: tick 间隔=10ms 时, task_delay_ms(50) = task_delay(5)
+ *       tick 间隔=1ms 时, task_delay_ms(50) = task_delay(50)
+ *
+ * @param ms  延时毫秒数
+ */
+void task_delay_ms(uint32_t ms);
+
 #endif /* TASK_H */

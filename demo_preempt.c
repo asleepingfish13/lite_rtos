@@ -25,7 +25,7 @@ static void task_high_func(void)
             printf("\n=== [HIGH] done ===\n");
             exit(0);
         }
-        task_delay(10);
+        task_delay_ms(100);
     }
 }
 
@@ -38,7 +38,7 @@ static void task_low_func(void)
             printf("\n=== [LOW] done ===\n");
             exit(0);
         }
-        task_delay(3);
+        task_delay_ms(30);
     }
 }
 
@@ -54,6 +54,9 @@ int main(void)
     printf("========================================\n\n");
 
     kernel_init();
+
+    /* 设置 tick 间隔: 10ms */
+    kernel_set_tick_interval_ms(10);
 
     task_create(task_high_func, "high", 0,  0);
     task_create(task_low_func,  "low",  0,  3);

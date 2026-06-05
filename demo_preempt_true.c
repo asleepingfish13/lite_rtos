@@ -56,7 +56,7 @@ static void task_preempt_func(void)
             printf("     即使 CPU_BURN 从不调用 task_delay()/task_yield()。\n");
             exit(0);
         }
-        task_delay(10);
+        task_delay_ms(100);
     }
 }
 
@@ -106,7 +106,7 @@ static void task_watchdog_func(void)
                    "低优先级任务未被 CPU_BURN 饿死\n");
             exit(0);
         }
-        task_delay(30);
+        task_delay_ms(300);
     }
 }
 
@@ -133,6 +133,9 @@ int main(void)
     printf("========================================\n\n");
 
     kernel_init();
+
+    /* 设置 tick 间隔: 10ms */
+    kernel_set_tick_interval_ms(10);
 
     task_create(task_preempt_func,   "preempt",  0, 0);
     task_create(task_watchdog_func,  "watchdog", 0, 1);

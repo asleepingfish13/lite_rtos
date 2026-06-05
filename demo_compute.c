@@ -186,7 +186,7 @@ static void task_matrix_func(void)
 
 #define FIB_BATCH_SIZE  10000000 /* 每次醒来计算 1000 万个数 (~3 ticks) */
 #define FIB_BATCHES     10       /* 计算 10 个批次后停止 */
-#define FIB_DELAY_TICKS 6        /* 批次间隔 6 ticks */
+#define FIB_DELAY_MS    60        /* 批次间隔 60ms */
 
 static void task_fib_func(void)
 {
@@ -199,8 +199,8 @@ static void task_fib_func(void)
     const double sqrt5 = 2.2360679774997896964;
 
     printf("[FIB]    tick=%-5u 开始批量计算斐波那契数列 "
-           "(每 %d ticks 醒来, 批量 %d 个)\n",
-           tick_count, FIB_DELAY_TICKS, FIB_BATCH_SIZE);
+           "(每 %u ms 醒来, 批量 %d 个)\n",
+           tick_count, FIB_DELAY_MS, FIB_BATCH_SIZE);
 
     while (1) {
         uint32_t start_tick = tick_count;
@@ -247,10 +247,10 @@ static void task_fib_func(void)
                    total_batches,
                    (unsigned long long)total_count);
             /* 不再运行, 让 MATRIX 完成剩余工作 */
-            while (1) task_delay(9999);
+            while (1) task_delay_ms(99990);
         }
 
-        task_delay(FIB_DELAY_TICKS);
+        task_delay_ms(FIB_DELAY_MS);
     }
 }
 
@@ -267,7 +267,7 @@ static void task_monitor_func(void)
     while (1) {
         printf("[MONITOR] tick=%-5u 系统存活! (第 %d 次检查)\n",
                tick_count, ++count);
-        task_delay(25);
+        task_delay_ms(250);
     }
 }
 
@@ -280,9 +280,9 @@ int main(void)
     printf("  Lite RTOS - Phase 8 Demo\n");
     printf("  真实计算 + 抢占 → 上下文验证\n");
     printf("========================================\n");
-    printf("  FIB:     prio=0  斐波那契 (~3 ticks) 每 %d ticks 醒来\n",
-           FIB_DELAY_TICKS);
-    printf("  MONITOR: prio=1  系统存活 (每 25 ticks)\n");
+    printf("  FIB:     prio=0  斐波那契 每 %ums 醒来\n",
+           FIB_DELAY_MS);
+    printf("  MONITOR: prio=1  系统存活 (每 250ms)\n");
     printf("  MATRIX:  prio=2  %dx%d 矩阵乘法 (持续)\n",
            MATRIX_N, MATRIX_N);
     printf("\n");
@@ -291,6 +291,9 @@ int main(void)
     printf("========================================\n\n");
 
     kernel_init();
+
+    /* 设置 tick 间隔: 10ms */
+    kernel_set_tick_interval_ms(10);
 
     task_create(task_fib_func,     "fib",     0,      0);
     task_create(task_monitor_func, "monitor", 0,      1);

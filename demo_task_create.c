@@ -21,6 +21,9 @@ int main(void)
 
     kernel_init();
 
+    /* 设置 tick 间隔: 10ms (虽未启动调度器，但保持一致) */
+    kernel_set_tick_interval_ms(10);
+
     /* 在不同优先级上创建任务 */
     task_create(dummy_task_func, "sensor",   0, 1);  /* 优先级 1 */
     task_create(dummy_task_func, "display",  0, 3);  /* 优先级 3 */

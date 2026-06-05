@@ -40,13 +40,13 @@
 extern void     schedule(void);
 extern void     schedule_from_isr(void);
 extern uint32_t tick_count;
+extern uint8_t  scheduler_running;
 extern tcb_t   *current_task;
 
 /* ====================================================================
- *  系统节拍常量
+ *  系统节拍配置
  * ==================================================================== */
-#define TICK_RATE_HZ     100
-#define TICK_INTERVAL_MS (1000 / TICK_RATE_HZ)   /* 10ms */
+static uint32_t g_tick_rate_hz = 100;  /* 默认 100Hz (10ms/tick)，可通过 kernel_set_tick_rate() 修改 */
 
 /* ====================================================================
  *  信号安全标志 (跨平台共用)
@@ -125,7 +125,9 @@ static DWORD WINAPI tick_thread_func(LPVOID param)
 {
     (void)param;
     while (tick_thread_running) {
-        Sleep(TICK_INTERVAL_MS);   /* 10ms (100Hz tick rate) */
+        DWORD sleep_ms = 1000 / g_tick_rate_hz;
+        if (sleep_ms < 1) sleep_ms = 1;  /* 防止 0ms Sleep (忙等) */
+        Sleep(sleep_ms);
         tick_pending = 1;
     }
     return 0;
@@ -147,8 +149,8 @@ void port_init_tick_timer(void)
         exit(1);
     }
 
-    printf("[port] Tick thread started: %d Hz (%d ms/tick)\n",
-           TICK_RATE_HZ, TICK_INTERVAL_MS);
+    printf("[port] Tick thread started: %u Hz (%lu ms/tick)\n",
+           g_tick_rate_hz, (unsigned long)(1000 / g_tick_rate_hz));
 }
 
 /* -------------------------------------------------------------------
@@ -230,6 +232,7 @@ void port_init_tick_timer(void)
 {
     struct sigaction sa;
     struct itimerval timer;
+    uint32_t interval_us = 1000000 / g_tick_rate_hz;
 
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = tick_signal_handler;
@@ -241,18 +244,18 @@ void port_init_tick_timer(void)
         exit(1);
     }
 
-    timer.it_value.tv_sec     = 0;
-    timer.it_value.tv_usec    = TICK_INTERVAL_MS * 1000;
-    timer.it_interval.tv_sec  = 0;
-    timer.it_interval.tv_usec = TICK_INTERVAL_MS * 1000;
+    timer.it_value.tv_sec     = interval_us / 1000000;
+    timer.it_value.tv_usec    = interval_us % 1000000;
+    timer.it_interval.tv_sec  = interval_us / 1000000;
+    timer.it_interval.tv_usec = interval_us % 1000000;
 
     if (setitimer(ITIMER_REAL, &timer, NULL) == -1) {
         perror("setitimer");
         exit(1);
     }
 
-    printf("[port] Tick timer started: %d Hz (%d ms/tick)\n",
-           TICK_RATE_HZ, TICK_INTERVAL_MS);
+    printf("[port] Tick timer started: %u Hz (%u ms/tick)\n",
+           g_tick_rate_hz, 1000 / g_tick_rate_hz);
 }
 
 /* -------------------------------------------------------------------
@@ -296,3 +299,58 @@ void port_idle_wait(void) { usleep(1000); }   /* Unix: 1000μs = 1ms */
 
 int  port_tick_pending(void) { return tick_pending; }
 void port_clear_tick(void)   { tick_pending = 0; }
+
+/* ====================================================================
+ *  Tick 间隔 API (毫秒级, 直设硬件定时器)
+ * ==================================================================== */
+
+uint32_t kernel_get_tick_rate(void)
+{
+    return g_tick_rate_hz;
+}
+
+void kernel_set_tick_rate(uint32_t hz)
+{
+    if (hz < 1 || hz > 1000) {
+        return;  /* 范围保护: 1Hz ~ 1000Hz */
+    }
+
+    port_disable_interrupts();
+
+    g_tick_rate_hz = hz;
+
+#ifdef _WIN32
+    /* Windows: tick 线程每循环读取 g_tick_rate_hz，无需额外操作 */
+    (void)0;
+#else
+    /* Unix: 若调度器已启动，重配置 setitimer */
+    if (scheduler_running) {
+        struct itimerval timer;
+        uint32_t interval_us = 1000000 / hz;
+
+        timer.it_value.tv_sec     = interval_us / 1000000;
+        timer.it_value.tv_usec    = interval_us % 1000000;
+        timer.it_interval.tv_sec  = interval_us / 1000000;
+        timer.it_interval.tv_usec = interval_us % 1000000;
+
+        setitimer(ITIMER_REAL, &timer, NULL);
+
+        /* 清除旧频率下残留的 tick 标志 */
+        port_clear_tick();
+    }
+#endif
+
+    port_enable_interrupts();
+}
+
+/* 毫秒级 API — 直设硬件定时器间隔 */
+void kernel_set_tick_interval_ms(uint32_t ms)
+{
+    if (ms < 1 || ms > 1000) return;  /* 1ms ~ 1000ms */
+    kernel_set_tick_rate(1000 / ms);
+}
+
+uint32_t kernel_get_tick_interval_ms(void)
+{
+    return 1000 / g_tick_rate_hz;
+}

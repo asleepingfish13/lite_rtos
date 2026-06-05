@@ -31,6 +31,11 @@ tcb_t *task_create(void (*task_func)(void),
                 priority, MAX_PRIORITIES - 1);
         return NULL;
     }
+    if (g_task_count >= g_max_tasks) {
+        fprintf(stderr, "task_create: task count %u reached limit %u\n",
+                g_task_count, g_max_tasks);
+        return NULL;
+    }
     if (stack_size == 0) {
         stack_size = DEFAULT_STACK_SIZE;
     }
@@ -71,6 +76,8 @@ tcb_t *task_create(void (*task_func)(void),
 
     printf("[kernel] Task '%s' created: priority=%u, stack=%u bytes\n",
            task->name, task->priority, task->stack_size);
+
+    g_task_count++;  /* 原子: 仅在主线程调用, 调度器启动前 */
 
     return task;
 }
@@ -126,4 +133,19 @@ void task_delay(uint32_t ticks)
 
     /* 触发调度: 切换到其他就绪任务 */
     schedule();
+}
+
+void task_delay_ms(uint32_t ms)
+{
+    if (ms == 0) return;
+
+    /* 将毫秒转为 tick 数: ticks = ceil(ms / interval_ms)
+     * 内部通过 kernel_get_tick_rate() 反算间隔避免额外依赖。
+     * 例如: tick 间隔=10ms → ms=50 → ticks=5
+     *       tick 间隔=1ms  → ms=50 → ticks=50 */
+    uint32_t hz = kernel_get_tick_rate();
+    uint32_t ticks = ((uint64_t)ms * hz + 999) / 1000;
+    if (ticks == 0) ticks = 1;  /* 最小延时 1 tick */
+
+    task_delay(ticks);
 }

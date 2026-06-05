@@ -40,8 +40,10 @@ static void task_b_func(void)
 int main(void)
 {
     printf("=== Phase 3-4: 合作式调度 Demo ===\n\n");
-
     kernel_init();
+
+    /* 设置 tick 间隔: 100ms (合作式调度, tick 频率不重要) */
+    kernel_set_tick_interval_ms(100);
 
     task_create(task_a_func, "task_a", 0, 1);
     task_create(task_b_func, "task_b", 0, 1);

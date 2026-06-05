@@ -3,7 +3,7 @@
 #   Windows MSYS2:  Fibers + 后台线程
 #
 # 使用方法:
-#   make              - 编译 (默认 demo_delay.c)
+#   make              - 编译 (默认 demo_yield.c)
 #   make run          - 编译并运行
 #   make DEMO=demo_list      - 切换不同 demo
 #   make run DEMO=demo_list  - 编译并运行指定 demo
@@ -14,12 +14,14 @@
 # 可用 DEMO:
 #   demo_list        - Phase 1: 侵入式链表
 #   demo_task_create - Phase 2: 任务创建
-#   demo_yield       - Phase 3-4: 合作式调度
-#   demo_delay       - Phase 5: 系统节拍与延时 (默认)
+#   demo_yield       - Phase 3-4: 合作式调度 (默认)
+#   demo_delay       - Phase 5: 系统节拍与延时
 #   demo_preempt      - Phase 6: 抢占式调度
 #   demo_preempt_true - Phase 7: 真抢占 (ISR 驱动)
 #   demo_compute       - Phase 8: 真实计算 + 抢占验证
 #   demo_car          - 综合: 智能小车巡线 + 多传感器 + 拍照
+#   demo_tick_rate    - Phase 9: 可变 tick 率 (环境监测 vs 小车巡线)
+#   demo_sem          - Phase 11: 计数信号量 (Counting Semaphore) + 小车传感器场景
 
 # -------------------------------------------------------------------
 # 平台自动检测
@@ -67,7 +69,7 @@ BUILD_DIR = build
 TARGET    = $(BUILD_DIR)/lite_rtos_demo$(EXE_EXT)
 
 # 选择 Demo 文件
-DEMO ?= demo_compute
+DEMO ?= demo_yield
 
 # demo_list 只需要链表模块，不需要内核
 ifeq ($(DEMO),demo_list)
@@ -78,6 +80,7 @@ else
     SRCS += kernel.c
     SRCS += task.c
     SRCS += port.c
+    SRCS += sem.c
     SRCS += $(DEMO).c
 endif
 
@@ -129,8 +132,12 @@ list-demos:
 	@echo "  make DEMO=demo_yield       - Phase 3-4: 合作式调度"
 	@echo "  make DEMO=demo_delay       - Phase 5: 系统节拍与延时"
 	@echo "  make DEMO=demo_preempt     - Phase 6: 抢占式调度"
-	@echo "  make DEMO=demo_preempt_true- Phase 7: 真抢占 (ISR 驱动, 默认)"
+	@echo "  make DEMO=demo_preempt_true- Phase 7: 真抢占 (ISR 驱动)"
+	@echo ""
+	@echo "  默认: make = make DEMO=demo_yield"
 	@echo "  make DEMO=demo_compute      - Phase 8: 真实计算 + 抢占验证"
 	@echo "  make DEMO=demo_car         - 综合: 小车巡线 + 多传感器 + 拍照"
+	@echo "  make DEMO=demo_tick_rate   - Phase 9: 可变 tick 率 (环境监测 vs 小车巡线)"
+	@echo "  make DEMO=demo_sem         - Phase 11: 计数信号量 + 小车传感器 (4 任务)"
 	@echo ""
 	@echo "  示例: make run DEMO=demo_car"

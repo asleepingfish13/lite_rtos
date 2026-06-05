@@ -78,8 +78,8 @@ static void task_fast_func(void)
             exit(0);
         }
 
-        printf("[FAST]  → task_delay(2), 进入延时链表...\n");
-        task_delay(2);
+        printf("[FAST]  → task_delay_ms(20), 进入延时链表...\n");
+        task_delay_ms(20);
     }
 }
 
@@ -99,8 +99,8 @@ static void task_medium_func(void)
             exit(0);
         }
 
-        printf("[MED]   → task_delay(5), 进入延时链表...\n");
-        task_delay(5);
+        printf("[MED]   → task_delay_ms(50), 进入延时链表...\n");
+        task_delay_ms(50);
     }
 }
 
@@ -120,8 +120,8 @@ static void task_slow_func(void)
             exit(0);
         }
 
-        printf("[SLOW]  → task_delay(8), 进入延时链表...\n");
-        task_delay(8);
+        printf("[SLOW]  → task_delay_ms(80), 进入延时链表...\n");
+        task_delay_ms(80);
     }
 }
 
@@ -137,13 +137,16 @@ int main(void)
     printf("========================================\n");
     printf("  Lite RTOS - Delayed List Demo\n");
     printf("========================================\n");
-    printf("  Task Fast:   delay=2 ticks (20ms)\n");
-    printf("  Task Medium: delay=5 ticks (50ms)\n");
-    printf("  Task Slow:   delay=8 ticks (80ms)\n");
+    printf("  Task Fast:   delay=20ms\n");
+    printf("  Task Medium: delay=50ms\n");
+    printf("  Task Slow:   delay=80ms\n");
     printf("  All priority=1 (same, FIFO order)\n");
     printf("========================================\n\n");
 
     kernel_init();
+
+    /* 设置 tick 间隔: 10ms (硬件定时器直设) */
+    kernel_set_tick_interval_ms(10);
 
     tcb_t *tf = task_create(task_fast_func,   "fast",   0, 1);
     tcb_t *tm = task_create(task_medium_func, "medium", 0, 1);

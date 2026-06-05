@@ -6,13 +6,13 @@
  *       到达目的地后触发摄像头拍照，展示多任务协作。
  *
  * 任务列表 (6 个用户任务 + idle):
- *   IR 传感器   prio=0  cycle=2t   最高优先级，实时检测障碍物
- *   巡线控制    prio=1  cycle=4t   核心: 读取线偏移，输出转向修正
- *   速度传感器  prio=2  cycle=6t   定期读取车轮编码器
- *   加速度计    prio=3  cycle=10t  读取 IMU 三轴加速度
- *   遥测显示    prio=4  cycle=20t  汇总打印所有传感器数据
- *   摄像头      prio=5  one-shot   到达目的地后拍照 (信号量触发)
- *   Idle        prio=7             CPU 空闲时运行
+ *   IR 传感器   prio=0  cycle=20ms  最高优先级，实时检测障碍物
+ *   巡线控制    prio=1  cycle=40ms  核心: 读取线偏移，输出转向修正
+ *   速度传感器  prio=2  cycle=60ms  定期读取车轮编码器
+ *   加速度计    prio=3  cycle=100ms 读取 IMU 三轴加速度
+ *   遥测显示    prio=4  cycle=200ms 汇总打印所有传感器数据
+ *   摄像头      prio=5  one-shot    到达目的地后拍照 (信号量触发)
+ *   Idle        prio=7              CPU 空闲时运行
  */
 
 #include <stdio.h>
@@ -53,7 +53,7 @@ static void ir_sensor_task(void)
 
         printf("  [IR 传感器]  tick=%-3u  前方=%dcm  线偏移=%+dmm\n",
                tick_count, ir_distance, line_offset);
-        task_delay(2);
+        task_delay_ms(20);
     }
     /* 到达后退出循环 */
 }
@@ -90,7 +90,7 @@ static void line_follow_task(void)
             printf("\n  *** 到达目的地！位置=%d/100  停车！***\n\n", car_position);
         }
 
-        task_delay(4);
+        task_delay_ms(40);
     }
 }
 
@@ -106,7 +106,7 @@ static void speed_sensor_task(void)
 
         printf("  [速度传感器] tick=%-3u  编码器读数=%dcm/s  (轮速=%drpm)\n",
                tick_count, raw_speed, raw_speed * 6);
-        task_delay(6);
+        task_delay_ms(60);
     }
 }
 
@@ -125,7 +125,7 @@ static void imu_task(void)
 
         printf("  [IMU/加速计] tick=%-3u  ax=%+.2fg  ay=%+.2fg  az=%.2fg\n",
                tick_count, accel_x, accel_y, accel_z);
-        task_delay(10);
+        task_delay_ms(100);
     }
 }
 
@@ -147,7 +147,7 @@ static void telemetry_task(void)
         printf("  │  状态:  %s                      │\n",
                car_position < 100 ? "巡线行驶中..." : "已到达!");
         printf("  └─────────────────────────────────────────┘\n\n");
-        task_delay(20);
+        task_delay_ms(200);
     }
 }
 
@@ -157,7 +157,7 @@ static void telemetry_task(void)
 static void camera_task(void)
 {
     while (!destination) {
-        task_delay(5);  /* 低频率检查 */
+        task_delay_ms(50);  /* 低频率检查 */
     }
 
     /* 到达目的地，模拟拍照流程 */
@@ -168,11 +168,11 @@ static void camera_task(void)
     printf("  ║   对焦中...                        ║\n");
 
     /* 模拟拍照需要时间，分步进行 */
-    task_delay(3);
+    task_delay_ms(30);
     printf("  ║   曝光中...  (位置=%d, v=0)         ║\n", car_position);
-    task_delay(2);
+    task_delay_ms(20);
     printf("  ║   图像处理中...                    ║\n");
-    task_delay(1);
+    task_delay_ms(10);
 
     photo_serial = 42;
     printf("  ║                                    ║\n");
@@ -207,19 +207,22 @@ int main(void)
     printf("  ╚══════════════════════════════════════════╝\n\n");
 
     printf("  任务列表:\n");
-    printf("  ┌──────────┬──────┬────────┬──────────────────┐\n");
-    printf("  │ 任务     │ 优先级│ 周期   │ 功能             │\n");
-    printf("  ├──────────┼──────┼────────┼──────────────────┤\n");
-    printf("  │ IR 传感器│  0   │  2t    │ 红外测距 + 线偏移 │\n");
-    printf("  │ 巡线控制 │  1   │  4t    │ 核心: PID 转向修正│\n");
-    printf("  │ 速度传感 │  2   │  6t    │ 编码器轮速读取   │\n");
-    printf("  │ IMU/加速 │  3   │  10t   │ 三轴加速度采集   │\n");
-    printf("  │ 遥测显示 │  4   │  20t   │ 状态汇总输出     │\n");
+    printf("  ┌──────────┬──────┬─────────┬──────────────────┐\n");
+    printf("  │ 任务     │ 优先级│ 周期    │ 功能             │\n");
+    printf("  ├──────────┼──────┼─────────┼──────────────────┤\n");
+    printf("  │ IR 传感器│  0   │ 20ms    │ 红外测距 + 线偏移 │\n");
+    printf("  │ 巡线控制 │  1   │ 40ms    │ 核心: PID 转向修正│\n");
+    printf("  │ 速度传感 │  2   │ 60ms    │ 编码器轮速读取   │\n");
+    printf("  │ IMU/加速 │  3   │ 100ms   │ 三轴加速度采集   │\n");
+    printf("  │ 遥测显示 │  4   │ 200ms   │ 状态汇总输出     │\n");
     printf("  │ 摄像头   │  5   │ one-shot│ 到达后拍照       │\n");
-    printf("  │ Idle     │  7   │  -     │ CPU 空闲         │\n");
-    printf("  └──────────┴──────┴────────┴──────────────────┘\n\n");
+    printf("  │ Idle     │  7   │  -      │ CPU 空闲         │\n");
+    printf("  └──────────┴──────┴─────────┴──────────────────┘\n\n");
 
     kernel_init();
+
+    /* 设置 tick 间隔: 10ms (直设硬件定时器) */
+    kernel_set_tick_interval_ms(10);
 
     task_create(ir_sensor_task,     "ir",       0, 0);
     task_create(line_follow_task,   "line",     0, 1);

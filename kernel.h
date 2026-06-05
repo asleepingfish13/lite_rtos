@@ -28,7 +28,7 @@
  * ==================================================================== */
 #define MAX_PRIORITIES      8       /* 优先级数量: 0(最高) ~ 7(最低/空闲) */
 #define IDLE_PRIORITY       (MAX_PRIORITIES - 1)
-#define MAX_TASKS           16      /* 最大任务数 */
+#define MAX_TASKS           16      /* 默认最大任务数 (可通过 kernel_set_max_tasks() 运行时修改) */
 #define DEFAULT_STACK_SIZE  8192    /* 8KB, PC 模拟用较大的栈 */
 
 /* ====================================================================
@@ -86,6 +86,8 @@ extern list_t   delayed_list;                   /* 延时任务链表 */
 extern tcb_t    idle_task_tcb;                  /* 空闲任务 TCB */
 extern uint32_t tick_count;                     /* 系统节拍计数 */
 extern uint8_t  scheduler_running;              /* 调度器是否已启动 */
+extern uint32_t  g_max_tasks;                   /* 运行时最大任务数 (可通过 API 修改) */
+extern uint32_t  g_task_count;                  /* 当前已创建的任务数 */
 
 /* ====================================================================
  *  宏: 从链表节点反查结构体指针 (FreeRTOS 风格)
@@ -113,5 +115,18 @@ void kernel_start(void);
 void schedule(void);
 void schedule_from_isr(void);   /* ISR/信号处理函数入口 */
 void task_yield(void);
+
+/* 任务数量上限 (运行时可变) */
+void     kernel_set_max_tasks(uint32_t max);    /* 设置最大任务数 (>=1, 已创建任务数不受影响) */
+uint32_t kernel_get_max_tasks(void);            /* 获取当前最大任务数 */
+uint32_t task_get_count(void);                  /* 获取当前已创建的任务数 */
+
+/* 系统节拍配置 */
+void     kernel_set_tick_interval_ms(uint32_t ms);  /* 设置 tick 间隔: 1~1000ms (直设硬件定时器) */
+uint32_t kernel_get_tick_interval_ms(void);         /* 获取 tick 间隔 (ms) */
+uint32_t kernel_get_tick_rate(void);                /* 获取当前 tick 频率 (Hz), 内部使用 */
+void     kernel_set_tick_rate(uint32_t hz);         /* 设置 tick 频率 (Hz), 内部使用 */
+
+#include "sem.h"
 
 #endif /* KERNEL_H */
