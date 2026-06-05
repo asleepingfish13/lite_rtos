@@ -111,6 +111,7 @@ extern uint8_t  scheduler_running;              /* 调度器是否已启动 */
 void kernel_init(void);
 void kernel_start(void);
 void schedule(void);
+void schedule_from_isr(void);   /* ISR/信号处理函数入口 */
 void task_yield(void);
 
 #endif /* KERNEL_H */

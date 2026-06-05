@@ -38,6 +38,7 @@
 
 /* 外部声明 (kernel.c) */
 extern void     schedule(void);
+extern void     schedule_from_isr(void);
 extern uint32_t tick_count;
 extern tcb_t   *current_task;
 
@@ -54,6 +55,12 @@ static volatile int tick_pending = 0;
 
 /* ====================================================================
  *  Windows 实现: Fibers API + 后台 tick 线程
+ *
+ *  注意: 真抢占 (ISR 驱动的上下文切换) 目前仅在 Unix 上通过
+ *  SIGALRM 实现。在 Windows 上，tick 线程运行在独立的 OS 线程中，
+ *  无法直接调用 SwitchToFiber() 操作主线程的 fiber。
+ *  Windows 上的抢占依赖 idle 任务的 tick_pending 轮询
+ *  和 task_delay()/task_yield() 调度点 (延迟抢占模式)。
  * ==================================================================== */
 #ifdef _WIN32
 
@@ -197,19 +204,26 @@ void port_switch_context(tcb_t *from, tcb_t *to)
 }
 
 /* -------------------------------------------------------------------
- *  Unix 系统节拍 (setitimer + SIGALRM)
+ *  Unix 系统节拍 (setitimer + SIGALRM)  —  真抢占模式
  *
- *  SIGALRM 处理函数在信号上下文中运行, 遵守信号安全规则:
- *    ✓ sig_atomic_t 读写
- *    ✗ 不调用 printf/malloc/list_* 等
+ *  SIGALRM 处理函数在信号上下文中运行，
+ *  直接调用 schedule_from_isr() 完成 tick 处理和抢占调度。
  *
- *  只设置 tick_pending 标志, 实际处理在 schedule() 中完成。
+ *  schedule_from_isr() 内部的代码路径遵守信号安全规则:
+ *    ✓ sig_atomic_t / volatile int 读写
+ *    ✓ sigprocmask (POSIX 异步信号安全)
+ *    ✓ 纯指针操作 (链表遍历/修改)
+ *    ✓ swapcontext (实践中在 macOS/Linux 上可从信号处理器调用)
+ *    ✗ 不调用 printf/malloc 等
  * ------------------------------------------------------------------- */
 
 static void tick_signal_handler(int sig)
 {
     (void)sig;
     tick_pending = 1;
+    schedule_from_isr();
+    /* 当被抢占的任务恢复时，从此处继续执行，
+     * 然后返回信号处理函数 → sigreturn 恢复任务原始上下文。 */
 }
 
 void port_init_tick_timer(void)

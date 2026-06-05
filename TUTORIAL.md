@@ -14,10 +14,11 @@
 5. [Phase 3：上下文切换的原理与实现](#5-phase-3上下文切换的原理与实现)
 6. [Phase 4：优先级调度器](#6-phase-4优先级调度器)
 7. [Phase 5：系统节拍与任务延时](#7-phase-5系统节拍与任务延时)
-8. [Phase 6：抢占式调度](#8-phase-6抢占式调度)
-9. [完整执行流程追踪](#9-完整执行流程追踪)
-10. [与 FreeRTOS 的对比](#10-与-freertos-的对比)
-11. [扩展方向](#11-扩展方向)
+8. [Phase 6：抢占式调度（延迟抢占）](#8-phase-6抢占式调度延迟抢占)
+9. [Phase 7：真抢占式调度（ISR 驱动）](#9-phase-7真抢占式调度isr-驱动)
+10. [完整执行流程追踪](#10-完整执行流程追踪)
+11. [与 FreeRTOS 的对比](#11-与-freertos-的对比)
+12. [扩展方向](#12-扩展方向)
 
 ---
 
@@ -1024,15 +1025,18 @@ task_delay(5) 调用:
   └─────────────────────────────────────────────────────────┘
 ```
 
-### 7.5 信号安全：为什么 tick handler 只设置标志？
+### 7.5 信号安全：为什么 tick handler 只设置标志？（Phase 5/6 设计）
 
 ```c
+// Phase 5/6 的 tick handler: 最安全但最保守的做法
 static void tick_signal_handler(int sig) {
     tick_pending = 1;   // 仅此而已！
 }
 ```
 
 `SIGALRM` 可能在**任何时刻**触发——包括正在 `list_insert_tail()` 的中间。如果 handler 中直接操作链表，会导致数据损坏。因此 handler 只设置 `sig_atomic_t` 标志，实际的链表操作推迟到 `schedule()`（中断被阻塞时）进行。
+
+> **进阶**：Phase 7（真抢占）突破了这一限制——信号处理函数直接调用 `schedule_from_isr()` 完成调度。这是通过严格的异步信号安全审计和 `sigprocmask` 管理实现的。详见 §9.5。
 
 **如果硬要在信号处理函数里操作链表会怎样？**
 
@@ -1074,7 +1078,7 @@ list->sentinel.prev = node;          // ④
 
 ---
 
-## 8. Phase 6：抢占式调度
+## 8. Phase 6：抢占式调度（延迟抢占）
 
 ### 8.1 合作式 vs 抢占式
 
@@ -1083,10 +1087,15 @@ list->sentinel.prev = node;          // ④
   任务必须主动 task_yield() 或 task_delay()，其他任务才能运行。
   如果某个任务写了 while(1) {} 而不 yield，整个系统卡死。
 
-抢占式调度 (Phase 6):
-  高优先级任务就绪时，内核可以"强制"暂停当前任务。
-  在 PC 模拟中，抢占发生在内核 API 调用边界 (task_delay/yield)。
-  在真实硬件上，中断返回时通过 PendSV 实现即时抢占。
+延迟抢占式调度 (Phase 6):
+  高优先级任务就绪时，内核在下一个"调度点"暂停当前任务。
+  调度点 = task_delay() / task_yield() / idle 轮询。
+  如果任务从不调用这些 API，高优先级任务仍然无法运行。
+
+真抢占式调度 (Phase 7):
+  高优先级任务就绪时，ISR 直接在中断上下文中完成上下文切换。
+  不管当前任务在做什么（死循环、计算密集型代码），
+  都会被立即强制暂停。详见下一章。
 ```
 
 ### 8.2 抢占如何发生
@@ -1121,10 +1130,10 @@ tick 12: LOW 运行 → delay(3)
 | 中断源 | SIGALRM 信号 | SysTick 硬件定时器 |
 | 上下文保存 | ucontext (OS 自动) | 硬件自动压栈 R0-R3,R12,LR,PC,xPSR |
 | 上下文切换 | swapcontext() | PendSV 汇编：手动保存 R4-R11，切换栈指针 |
-| 抢占时机 | 下一个内核 API 调用 | SysTick ISR 返回时立即触发 PendSV |
+| 抢占时机 | Phase 6: 内核 API 调用边界<br>Phase 7: ISR 中直接切换 (见 §9) | SysTick ISR 返回时立即触发 PendSV |
 | 临界区 | 阻塞 SIGALRM | 禁用中断 (BASEPRI / PRIMASK) |
 
-**为什么 PC 上不是在任意时刻抢占？** 因为信号 handler 中操作内核数据结构不安全（不是异步信号安全的）。真实硬件没有这个问题——中断 handler 中可以直接操作就绪链表，因为硬件保证中断上下文不会被其他中断打断（同优先级或更低优先级的中断被屏蔽）。
+**为什么 PC 上延迟抢占曾被限制在 API 边界？** 因为信号 handler 中操作内核数据结构不安全（不是异步信号安全的）。Phase 7 通过严格的异步信号安全审计（只做指针/整数操作 + swapcontext）和 sigprocmask 管理突破了这一限制。真实硬件没有这个问题——中断 handler 中可以直接操作就绪链表，因为硬件保证中断上下文不会被其他中断打断（同优先级或更低优先级的中断被屏蔽）。
 
 **ARM 硬件为什么可以安全操作？四层保护机制：**
 
@@ -1183,11 +1192,328 @@ Phase 6 demo 的关键观察：
 
 ---
 
-## 9. 完整执行流程追踪
+## 9. Phase 7：真抢占式调度（ISR 驱动）
 
-本节从头到尾追踪一次完整的任务执行流程。
+### 推荐先读这些文件
 
-### 9.1 启动流程
+> `port.c` (tick_signal_handler) → `kernel.c` (schedule_from_isr, schedule_select_and_switch) → `demo_preempt_true.c`
+
+### 9.1 Phase 6 的局限：为什么延迟抢占不够？
+
+回顾 Phase 6 的抢占机制：
+
+```
+tick 10: SIGALRM → tick_pending = 1 → 返回
+         ... LOW 继续运行 ...
+         LOW 调用 task_delay(3) → schedule()
+           → process_tick() → HIGH 到期 → swapcontext(LOW, HIGH)
+           ↑ 抢占发生在 task_delay() 内部！
+```
+
+**问题**：如果 LOW 是一个 CPU 密集型死循环——
+
+```c
+void task_low_func(void) {
+    while (1) {
+        compute_pi_decimal();  // 纯计算，从不调用 task_delay
+    }
+}
+```
+
+那么 `schedule()` 永远不会被调用，`tick_pending` 永远不会被处理，HIGH 任务永远不会运行。**整个系统卡死。**
+
+### 9.2 真抢占的解决方案
+
+**核心思路**：让信号处理函数直接完成调度，不等下次 `schedule()` 调用。
+
+```
+之前 (Phase 6, 延迟抢占):
+  SIGALRM → tick_signal_handler()
+              → tick_pending = 1;     // 只设标志
+              → return;               // 返回原任务
+  ... 等下次 task_delay/yield/idle 轮询 ...
+  schedule() → process_tick() → swapcontext()
+
+之后 (Phase 7, 真抢占):
+  SIGALRM → tick_signal_handler()
+              → tick_pending = 1;
+              → schedule_from_isr();   // 直接调度！
+                → process_tick()       // 处理 tick
+                → sigprocmask(UNBLOCK) // 解阻塞信号
+                → schedule_select_and_switch()
+                  → find_highest_priority_task()
+                  → swapcontext(prev, next)  ← 立即切换！
+```
+
+### 9.3 架构设计：三个函数的职责划分
+
+真抢占重构引入了清晰的三层结构：
+
+```
+┌──────────────────────────────────────────────────────┐
+│  调用层                                               │
+│                                                      │
+│  schedule()             schedule_from_isr()           │
+│  任务上下文入口          ISR/信号上下文入口             │
+│  (task_delay 调用)      (tick_signal_handler 调用)    │
+│       │                      │                       │
+│       ├─ disable interrupts   ├─ process_tick()      │
+│       ├─ process_tick()       ├─ sigprocmask(UNBLOCK)│
+│       ├─ enable interrupts    │         │             │
+│       │        │              │         │             │
+│       └────────┼──────────────┘         │             │
+│                ▼                        │             │
+│  schedule_select_and_switch()  ←────────┘             │
+│  共享调度核心 (异步信号安全)                            │
+│    ├─ find_highest_priority_task()                    │
+│    └─ port_switch_context(prev, next)                 │
+└──────────────────────────────────────────────────────┘
+```
+
+**`schedule_select_and_switch()`** — 纯调度逻辑，不碰信号掩码，不含 printf/malloc：
+
+```c
+static void schedule_select_and_switch(void)
+{
+    tcb_t *next = find_highest_priority_task();
+
+    /* idle 任务始终就绪，next 不可能为 NULL */
+    if (next == NULL || next == current_task) {
+        return;
+    }
+
+    tcb_t *prev = current_task;
+
+    if (prev->state == TASK_RUNNING) {
+        prev->state = TASK_READY;
+    }
+    next->state = TASK_RUNNING;
+    current_task = next;
+
+    port_switch_context(prev, next);
+    /* ---- 上下文切换发生在这里 ---- */
+}
+```
+
+关键设计决策：
+- 移除了 `fprintf(stderr, ...)` 错误处理 → 信号上下文中不安全
+- 改为静默返回 → idle 任务始终就绪，NULL 场景不会发生
+- 不调用 `sigprocmask` → 由调用者管理信号掩码
+
+**`schedule_from_isr()`** — ISR 入口，管理信号掩码生命周期：
+
+```c
+void schedule_from_isr(void)
+{
+    /* 1. 处理 tick */
+    process_tick();
+
+#ifndef _WIN32
+    /* 2. 解除 SIGALRM 阻塞
+     *    当前在信号处理函数中，SIGALRM 被内核自动阻塞。
+     *    必须在切换到新任务前解阻塞，否则新任务永远无法被抢占。 */
+    {
+        sigset_t mask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGALRM);
+        sigprocmask(SIG_UNBLOCK, &mask, NULL);
+    }
+#endif
+
+    /* 3. 调度决策 + 上下文切换 */
+    schedule_select_and_switch();
+    /* 当被抢占任务恢复时，从此处继续 */
+
+#ifndef _WIN32
+    /* 4. 恢复信号掩码
+     *    重新阻塞 SIGALRM 匹配信号处理函数上下文。
+     *    返回后 sigreturn 恢复任务原始掩码。 */
+    {
+        sigset_t mask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGALRM);
+        sigprocmask(SIG_BLOCK, &mask, NULL);
+    }
+#endif
+}
+```
+
+**`schedule()`** — 任务上下文入口（简化后）：
+
+```c
+void schedule(void)
+{
+    port_disable_interrupts();
+
+    if (port_tick_pending()) {
+        process_tick();
+    }
+
+    /* 先开中断再切换，确保新任务以中断开启状态运行 */
+    port_enable_interrupts();
+    schedule_select_and_switch();
+}
+```
+
+### 9.4 信号掩码生命周期 — 这是正确性的关键
+
+真抢占最精妙的部分是信号掩码管理。如果搞错，新任务可能带着被阻塞的 SIGALRM 运行，导致它永远无法再被抢占。
+
+```
+Task A 运行中 (SIGALRM unblocked)
+  │
+  │ SIGALRM 触发
+  ▼
+┌─ 内核自动阻塞 SIGALRM ──────────────────────────────┐
+│                                                     │
+│ tick_signal_handler()                               │
+│   → tick_pending = 1;                               │
+│   → schedule_from_isr()                             │
+│       → process_tick()           // 唤醒到期任务      │
+│       → sigprocmask(UNBLOCK)     // ❶ 解阻塞 SIGALRM │
+│       → schedule_select_and_switch()                 │
+│           → swapcontext(A → B)   // ❷ 切换到 Task B  │
+│                                                     │
+├─ Task B 运行 (SIGALRM unblocked) ✅ 可被抢占 ────────┤
+│   ... B 做了些事，可能被抢占，可能阻塞 ...             │
+│   ... 最终 A 被恢复 ...                              │
+│                                                     │
+│       ← swapcontext 返回        // ❸ A 在此恢复      │
+│       → sigprocmask(BLOCK)      // ❹ 重新阻塞 SIGALRM│
+│   ← 返回到 tick_signal_handler                      │
+├─ 信号处理函数返回                                    │
+│   → sigreturn 恢复 A 的原始掩码 (unblocked)          │
+└─────────────────────────────────────────────────────┘
+  │
+  ▼
+Task A 继续运行 (SIGALRM unblocked) ✅
+```
+
+**四个关键步骤**：
+
+| 步骤 | 操作 | 为什么 |
+|------|------|--------|
+| ❶ | `sigprocmask(UNBLOCK)` | 信号处理函数中 SIGALRM 被内核自动阻塞。不手动解阻塞的话，swapcontext 过去的 Task B 会带着阻塞的 SIGALRM 运行——它收不到任何 tick 信号，无法再被抢占 |
+| ❷ | `swapcontext(A→B)` | 保存 A 的上下文（含信号栈帧），恢复 B 的上下文。A 的 swapcontext 调用"暂停"在这里 |
+| ❸ | swapcontext 返回 | 当 A 被重新调度时，执行从这里继续——仿佛 swapcontext 只是一个"耗时很长的函数" |
+| ❹ | `sigprocmask(BLOCK)` | 恢复信号处理函数的预期掩码。sigreturn 会基于此恢复 A 的原始掩码 |
+
+**为什么不在 schedule() 中做这些？**
+
+因为 `schedule()` 是从任务上下文调用的（task_delay / task_yield / idle）。此时 SIGALRM 的状态由 `port_disable_interrupts()` / `port_enable_interrupts()` 管理，不需要 `schedule_from_isr()` 的额外掩码操作。两个入口各有各的掩码管理策略。
+
+### 9.5 异步信号安全性分析
+
+从信号处理函数调用 `schedule_from_isr()` 的整个调用链中，每个操作都需要经受异步信号安全的检验：
+
+| 操作 | 是否安全 | 理由 |
+|------|----------|------|
+| `tick_pending = 1` | ✅ 安全 | `volatile int` 赋值 |
+| `tick_count++` | ✅ 安全 | 整数算术 |
+| `list_for_each_safe` 遍历 | ✅ 安全 | 纯指针遍历，不分配内存 |
+| `list_remove` / `list_insert_tail` | ✅ 安全 | 纯指针操作（改 prev/next），不调 malloc |
+| `task->delay_ticks--` | ✅ 安全 | 整数算术 |
+| `task->state = ...` | ✅ 安全 | 整数赋值 |
+| `find_highest_priority_task()` | ✅ 安全 | 仅链表判空（指针比较）+ `list_first`（指针解引用）+ `list_entry`（指针算术） |
+| `sigprocmask` | ✅ 安全 | **POSIX 明确列为异步信号安全** |
+| `swapcontext` | ✅ 实践安全 | POSIX 未列入但被 GNU Pth、libaco 等用户态线程库广泛从信号处理器调用 |
+| `printf` / `fprintf` / `malloc` | ❌ 不安全 | **已从共享代码路径中移除** |
+
+**关键安全保证**：`schedule_select_and_switch()` 和 `process_tick()` 的代码路径不含任何 `printf`、`malloc`、`fprintf` 调用。唯一的"灰色地带"是 `swapcontext`，它在 macOS/Linux 上从信号处理器调用的可靠性已被十余年的用户态线程库实践验证。
+
+**临界区保护仍然生效**：`port_disable_interrupts()` 在 `task_delay()` 和 `schedule()`（任务上下文入口）中阻塞 SIGALRM。如果代码正在操作就绪链表（如在 `task_delay` 的临界区内），SIGALRM 被阻塞，信号处理函数不会触发。信号只在安全窗口（链表操作完成后、`port_enable_interrupts()` 调用后）才会被递送。
+
+### 9.6 修改的代码文件一览
+
+| 文件 | 改动 |
+|------|------|
+| `kernel.h` | 新增 `void schedule_from_isr(void);` 声明 |
+| `kernel.c` | 新增 `schedule_select_and_switch()` 静态函数；新增 `schedule_from_isr()`；简化 `schedule()`；添加 `#include <signal.h>`（Unix） |
+| `port.c` | `tick_signal_handler()` 从"只设标志"改为直接调用 `schedule_from_isr()`；添加 Windows 限制注释；添加 `extern schedule_from_isr` 声明 |
+| `demo_preempt_true.c` | **新建**：真抢占验证 demo（CPU_BURN 死循环永不 yield，PREEMPT 通过 ISR 抢占） |
+| `Makefile` | 添加 `demo_preempt_true` 构建目标 |
+
+### 9.7 真抢占 Demo 验证
+
+`demo_preempt_true.c` 设计为**只有真抢占才能通过**的测试：
+
+```c
+/* CPU_BURN: 纯死循环，从不调用 task_delay 或 task_yield */
+static void task_cpu_burn_func(void) {
+    volatile uint64_t counter = 0;
+    while (1) {
+        counter++;  // 永不主动让出 CPU
+    }
+}
+
+/* PREEMPT: 高优先级，每 10 ticks 醒来 */
+static void task_preempt_func(void) {
+    while (1) {
+        printf("[PREEMPT] tick=%u\n", tick_count);
+        task_delay(10);  // 只有这里会阻塞
+    }
+}
+```
+
+**如果是 Phase 6（延迟抢占）**：CPU_BURN 启动后进入死循环，`schedule()` 永远不会被调用。PREEMPT 的 delay 到期后虽然被 `process_tick()` 移回就绪链表，但没有调度点来执行 `schedule()` → `swapcontext()`。**PREEMPT 永远不会打印。**
+
+**如果是 Phase 7（真抢占）**：tick 10 时，SIGALRM 信号处理函数直接调用 `schedule_from_isr()` → `process_tick()` 唤醒 PREEMPT → `schedule_select_and_switch()` 发现 PREEMPT 优先级更高 → `swapcontext(CPU_BURN → PREEMPT)`。**PREEMPT 准时在 tick 10 打印！**
+
+实际运行输出：
+
+```
+[CPU_BURN] tick=5     counter=50000001    ← CPU_BURN 在死循环中
+[CPU_BURN] tick=8     counter=100000002   ← 仍然在死循环
+⚡ [PREEMPT] tick=10   elapsed=10 ticks   ← 抢占成功！CPU_BURN 从未调用 task_delay！
+[CPU_BURN] tick=11    counter=150000003   ← PREEMPT delay 后回到 CPU_BURN
+[CPU_BURN] tick=14    counter=200000004   ← 继续死循环
+⚡ [PREEMPT] tick=20   elapsed=10 ticks   ← 再次准时抢占！
+```
+
+关键证据：**`elapsed=10 ticks`** — PREEMPT 每次恰好间隔 10 ticks 出现，而 CPU_BURN 的 counter 在两次 PREEMPT 之间持续递增。这证明：
+1. CPU_BURN 确实在不间断地运行（counter 在涨）
+2. PREEMPT 被信号处理函数从 CPU_BURN 手中"强行"抢走了 CPU
+3. PREEMPT 运行完后，CPU_BURN 从被中断的位置恢复继续（counter 值连续）
+
+### 9.8 延迟抢占 vs 真抢占：一句话总结
+
+```
+延迟抢占 (Phase 6):
+  "我会在下个路口停车换人，但你要等到我主动开到这个路口。"
+  抢占触发点 = task_delay() / task_yield() / idle 轮询
+
+真抢占 (Phase 7):
+  "不管你在高速公路上开多快，我直接拉手刹换人。"
+  抢占触发点 = 任意时刻（信号/中断随时到达）
+```
+
+### 9.9 Windows 平台说明
+
+真抢占（ISR 驱动的上下文切换）目前仅在 Unix 平台上实现。Windows 的 tick 机制使用独立的后台线程（`CreateThread`），`SwitchToFiber()` 只能由拥有该 fiber 的线程调用——后台 tick 线程无法直接切换主线程的 fiber。因此 Windows 上保持 Phase 6 的延迟抢占模式，依赖 idle 任务的 `tick_pending` 轮询。`schedule_from_isr()` 中的 `sigprocmask` 调用已用 `#ifndef _WIN32` 保护。
+
+### 9.10 学习检查点
+
+运行真抢占 demo：
+```bash
+make clean && make DEMO=demo_preempt_true && ./build/lite_rtos_demo
+```
+
+关键观察：
+```
+⚡ [PREEMPT]  tick=10   elapsed=10 ticks    ← CPU_BURN 从未 yield，但 PREEMPT 出现了！
+⚡ [PREEMPT]  tick=20   elapsed=10 ticks    ← 精确的 10 tick 间隔
+⚡ [PREEMPT]  tick=30   elapsed=10 ticks    ← 证明 ISR 直接完成了调度
+```
+
+如果看不到 PREEMPT 的输出，说明抢占没有发生——检查是否正确修改了 `tick_signal_handler()`。
+
+---
+
+## 10. 完整执行流程追踪
+
+本节从头到尾追踪一次完整的任务执行流程，涵盖延迟抢占和真抢占两种路径。
+
+### 10.1 启动流程
 
 ```
 main()
@@ -1229,7 +1555,7 @@ main()
   └─ // 永远不会执行到这里
 ```
 
-### 9.2 任务切换流程
+### 10.2 任务切换流程 (延迟抢占路径)
 
 ```
 Task A (task_a_func 运行中)
@@ -1273,7 +1599,7 @@ Task A (task_a_func 运行中)
   └─ // 回到 while(1) 循环，下一轮迭代
 ```
 
-### 9.3 Tick 处理流程
+### 10.3 Tick 处理流程 (延迟抢占路径)
 
 ```
 [硬件定时器] 每 10ms 触发 SIGALRM
@@ -1303,9 +1629,79 @@ Task A (task_a_func 运行中)
       └─ port_switch_context() (如果需要)
 ```
 
+### 10.4 ISR 真抢占路径 (Phase 7)
+
+```
+[硬件定时器] 每 10ms 触发 SIGALRM
+  │
+  ├─ (内核保存当前任务的所有寄存器到信号栈帧)
+  ├─ tick_signal_handler(SIGALRM)
+  │   ├─ tick_pending = 1;
+  │   └─ schedule_from_isr()
+  │       ├─ process_tick()            // 遍历延时链表，唤醒到期任务
+  │       │   ├─ tick_count++
+  │       │   ├─ task_H: delay_ticks: 1→0 (到期!)
+  │       │   │   ├─ list_remove(H 的 node)
+  │       │   │   └─ task_add_to_ready(H)  // H 回到 ready_lists[0]
+  │       │   └─ task_L: delay_ticks: 2→1 (未到期)
+  │       │
+  │       ├─ sigprocmask(SIG_UNBLOCK)  // 解阻塞 SIGALRM
+  │       │                            // 确保切换到的任务可被抢占
+  │       │
+  │       ├─ schedule_select_and_switch()
+  │       │   ├─ next = find_highest_priority_task()
+  │       │   │   扫描: ready_lists[0]→H! 优先级 0 > 当前(LOW=3)
+  │       │   │
+  │       │   ├─ prev = current_task (LOW)
+  │       │   ├─ prev->state = TASK_READY
+  │       │   ├─ next->state = TASK_RUNNING
+  │       │   ├─ current_task = H
+  │       │   │
+  │       │   └─ port_switch_context(LOW, H)
+  │       │       └─ swapcontext(&LOW.context, &H.context)
+  │       │          ① 保存当前 CPU 寄存器 → LOW.context
+  │       │             (保存的是信号处理函数内的执行状态!)
+  │       │          ② 恢复 H.context 的寄存器
+  │       │             (H 从上次 task_delay 的 swapcontext 后继续)
+  │       │          ③ 跳转到 H 的代码
+  │       │
+  │       │   ┌──────────────────────────────────────────┐
+  │       │   │  Task H (task_high_func)                 │
+  │       │   │  printf("[HIGH] tick=%u\n", tick_count)  │
+  │       │   │  task_delay(10)                          │
+  │       │   │    → schedule()                          │
+  │       │   │      → port_disable_interrupts()         │
+  │       │   │      → process_tick() (如果需要)          │
+  │       │   │      → port_enable_interrupts()          │
+  │       │   │      → schedule_select_and_switch()      │
+  │       │   │        → next = LOW (idle 不参与)        │
+  │       │   │        → swapcontext(H, LOW)             │
+  │       │   └──────────────────────────────────────────┘
+  │       │
+  │       │  ④ LOW 从 swapcontext 返回 (在 schedule_from_isr 中!)
+  │       │     ↓
+  │       ├─ sigprocmask(SIG_BLOCK)    // 恢复信号处理函数掩码
+  │       │
+  │       └─ 返回到 tick_signal_handler
+  │
+  ├─ tick_signal_handler 返回
+  ├─ sigreturn: 内核恢复 LOW 的原始寄存器状态 (SIGALRM unblocked)
+  └─ LOW 从被 SIGALRM 打断的位置继续执行
+       (仿佛只是"愣了一瞬间"，完全不知道 H 已经运行过)
+```
+
+**关键观察**：
+
+1. LOW 被 SIGALRM 打断时正在执行任意代码（死循环 `counter++`），没有调用任何内核 API
+2. 信号处理函数直接完成了 tick 处理 + 调度决策 + 上下文切换
+3. `swapcontext` 保存的不是"LOW 的任务代码执行位置"，而是"信号处理函数内的执行位置"——这包含了信号栈帧，恢复时 sigreturn 自然把 LOW 放回被中断的指令之后
+4. LOW "感觉"自己只是被暂停了一瞬间，完全不知道 H 已经运行过
+
+这就是真正的抢占——**不需要任务配合，内核在中断上下文中强制切换。**
+
 ---
 
-## 10. 与 FreeRTOS 的对比
+## 11. 与 FreeRTOS 的对比
 
 | 概念 | Lite RTOS | FreeRTOS |
 |------|-----------|----------|
@@ -1315,7 +1711,9 @@ Task A (task_a_func 运行中)
 | 链表节点 | `list_node_t` | `xLIST_ITEM` |
 | 链表头 | `list_t` (带 sentinel) | `xLIST` (带 xListEnd) |
 | 反查宏 | `list_entry()` | `listGET_OWNER_OF_NEXT_ENTRY()` |
-| 调度器 | `schedule()` | `vTaskSwitchContext()` |
+| 调度器 (任务上下文) | `schedule()` | `vTaskSwitchContext()` |
+| 调度器 (ISR 上下文) | `schedule_from_isr()` | `vTaskSwitchContext()` (PendSV 中) |
+| 真抢占 | ✅ ISR 直接调用 `schedule_from_isr()` | ✅ SysTick → PendSV |
 | 任务延时 | `task_delay()` | `vTaskDelay()` |
 | 空闲任务 | `idle_task` (自动创建) | `prvIdleTask` (自动创建) |
 | 上下文切换 | `swapcontext()` | PendSV 汇编 |
@@ -1330,9 +1728,9 @@ Task A (task_a_func 运行中)
 
 ---
 
-## 11. 扩展方向
+## 12. 扩展方向
 
-### 11.1 优先级位图加速
+### 12.1 优先级位图加速
 
 当前 `find_highest_priority_task()` 每次扫描 8 个优先级。用位图只需一条 `__builtin_clz()` 指令：
 
@@ -1353,7 +1751,7 @@ static tcb_t *find_highest_priority_task(void) {
 }
 ```
 
-### 11.2 时间片轮转
+### 12.2 时间片轮转
 
 同优先级任务各执行 1 个 tick，然后自动切换到同优先级的下一个：
 
@@ -1366,7 +1764,7 @@ if (当前任务优先级有其他就绪任务 && 时间片用完) {
 }
 ```
 
-### 11.3 信号量 (Semaphore)
+### 12.3 信号量 (Semaphore)
 
 ```c
 typedef struct {
@@ -1403,7 +1801,7 @@ void sem_give(semaphore_t *sem) {
 }
 ```
 
-### 11.4 ARM Cortex-M3 移植
+### 12.4 ARM Cortex-M3 移植
 
 替换 `port.c` 中的 ucontext 操作为：
 
@@ -1424,7 +1822,7 @@ PendSV_Handler:
     bx      lr                     /* 返回，硬件自动恢复 R0-R3,R12,LR,PC,xPSR */
 ```
 
-### 11.5 调试增强
+### 12.5 调试增强
 
 ```c
 // 打印所有任务状态 (调试神器)
@@ -1507,9 +1905,10 @@ make clean && make
 | 5 | `task.c` | `task_create()` 的 4 个步骤、`task_delay()` 的 5 个步骤 |
 | 6 | `port.h` | 平台移植 API |
 | 7 | `port.c` | `port_init_task_context()` → `port_start_first_task()` → `port_switch_context()` |
-| 8 | `kernel.c` | `kernel_init()` → `kernel_start()` → `schedule()` → `process_tick()` |
-| 9 | `demo.c` | 看一个完整的应用如何使用这些 API |
-| 10 | 全部重读一遍 | 第二次阅读会有全新的理解 |
+| 8 | `kernel.c` | `kernel_init()` → `kernel_start()` → `schedule()` → `process_tick()` → `schedule_from_isr()` |
+| 9 | `demo_preempt.c` | 看延迟抢占如何工作（Phase 6） |
+| 10 | `demo_preempt_true.c` | 看真抢占如何工作（Phase 7）— CPU 密集型任务被 ISR 强制切换 |
+| 11 | 全部重读一遍 | 第二次阅读会有全新的理解 |
 
 ## 附录 C：常见面试/理解问题
 
@@ -1523,3 +1922,7 @@ make clean && make
 8. **如果所有任务都阻塞了会怎样？** → 空闲任务 (idle) 始终就绪，CPU 不会停止
 9. **swapcontext 保存了多少寄存器？** → 所有通用寄存器 (RIP, RSP, RBP, RAX, RBX, RCX, RDX, RSI, RDI, R8-R15, 标志寄存器等)
 10. **如何验证抢占确实发生了？** → Phase 6 demo 中 HIGH 任务每 10 tick 精确出现在输出中，即使 LOW 每 3 tick 运行一次
+11. **延迟抢占和真抢占有什么区别？** → 延迟抢占只在 task_delay/yield/idle 轮询时发生，真抢占在 ISR 中直接完成上下文切换。详见 §9.8
+12. **为什么真抢占需要 sigprocmask 操作？** → 信号处理函数中 SIGALRM 被内核自动阻塞，不手动解阻塞的话切换到的任务无法再被抢占。详见 §9.4
+13. **Windows 上为什么没有真抢占？** → `SwitchToFiber()` 只能由拥有该 fiber 的线程调用，后台 tick 线程无法操作主线程的 fiber。详见 §9.9
+14. **schedule() 和 schedule_from_isr() 的区别？** → schedule() 在任务上下文中调用，自己负责开关中断；schedule_from_isr() 在 ISR 上下文中调用，额外管理信号掩码。详见 §9.3

@@ -16,8 +16,9 @@
 #   demo_task_create - Phase 2: 任务创建
 #   demo_yield       - Phase 3-4: 合作式调度
 #   demo_delay       - Phase 5: 系统节拍与延时 (默认)
-#   demo_preempt     - Phase 6: 抢占式调度
-#   demo_car         - 综合: 智能小车巡线 + 多传感器 + 拍照
+#   demo_preempt      - Phase 6: 抢占式调度
+#   demo_preempt_true - Phase 7: 真抢占 (ISR 驱动)
+#   demo_car          - 综合: 智能小车巡线 + 多传感器 + 拍照
 
 # -------------------------------------------------------------------
 # 平台自动检测
@@ -65,7 +66,7 @@ BUILD_DIR = build
 TARGET    = $(BUILD_DIR)/lite_rtos_demo$(EXE_EXT)
 
 # 选择 Demo 文件
-DEMO ?= demo_car
+DEMO ?= demo_preempt_true
 
 # demo_list 只需要链表模块，不需要内核
 ifeq ($(DEMO),demo_list)
@@ -125,8 +126,9 @@ list-demos:
 	@echo "  make DEMO=demo_list        - Phase 1: 侵入式链表"
 	@echo "  make DEMO=demo_task_create - Phase 2: 任务创建"
 	@echo "  make DEMO=demo_yield       - Phase 3-4: 合作式调度"
-	@echo "  make DEMO=demo_delay       - Phase 5: 系统节拍与延时 (默认)"
+	@echo "  make DEMO=demo_delay       - Phase 5: 系统节拍与延时"
 	@echo "  make DEMO=demo_preempt     - Phase 6: 抢占式调度"
+	@echo "  make DEMO=demo_preempt_true- Phase 7: 真抢占 (ISR 驱动, 默认)"
 	@echo "  make DEMO=demo_car         - 综合: 小车巡线 + 多传感器 + 拍照"
 	@echo ""
 	@echo "  示例: make run DEMO=demo_car"
