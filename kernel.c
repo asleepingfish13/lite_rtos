@@ -27,6 +27,7 @@ uint32_t  tick_count = 0;                     /* 系统节拍计数 */
 uint8_t   scheduler_running = 0;              /* 调度器是否已启动 */
 uint32_t  g_max_tasks = MAX_TASKS;            /* 运行时最大任务数 (可通过 API 修改) */
 uint32_t  g_task_count = 0;                   /* 当前已创建的任务数 (不含 idle) */
+uint32_t  g_time_slice_ticks = TIME_SLICE_DEFAULT_TICKS; /* 运行时时间片配置 */
 
 /* 空闲任务栈 */
 static uint8_t idle_stack[DEFAULT_STACK_SIZE];
@@ -66,6 +67,12 @@ static void process_tick(void)
     list_node_t *node, *tmp;
 
     tick_count++;
+
+    /* 时间片递减: 每个 tick 消耗当前任务 1 个时间片
+     * 空闲任务不参与, 时间片已为 0 则不再递减 */
+    if (current_task != &idle_task_tcb && current_task->time_slice_ticks > 0) {
+        current_task->time_slice_ticks--;
+    }
 
     /* 每个 tick 打印被中断的任务 (调试用)
      * 注意: 此时调度尚未发生, 显示的是 tick 中断时正在运行的任务。
@@ -122,6 +129,43 @@ static tcb_t *find_highest_priority_task(void)
 static void schedule_select_and_switch(void)
 {
     tcb_t *next = find_highest_priority_task();
+
+    /* ================================================================
+     *  时间片轮转调度 (Round-Robin)
+     *
+     *  当最高优先级就绪任务就是 current_task 自身，
+     *  且其时间片已耗尽 (time_slice_ticks == 0)，
+     *  且该优先级上还有其他就绪任务时:
+     *    1. 将 current_task 从链表头部移到尾部 (rotate)
+     *    2. 给被旋转的任务一个新的完整时间片
+     *    3. 选取新的链表头部任务作为 next
+     *
+     *  空闲任务不参与轮转 (它永远不应该"用完"时间片)。
+     *  当 g_time_slice_ticks == 0 时全局禁用轮转。
+     * ================================================================ */
+    if (next == current_task &&
+        current_task != &idle_task_tcb &&
+        current_task->time_slice_ticks == 0 &&
+        g_time_slice_ticks > 0) {
+
+        list_t *rl = &ready_lists[current_task->priority];
+
+        /* 确认该优先级上至少还有一个其他任务
+         * (即链表头节点的 next 不是 sentinel)。
+         * 如果只有 current_task 自己, 没必要轮转。 */
+        if (rl->sentinel.next->next != &rl->sentinel) {
+            /* 旋转: 从头部移除, 插入尾部 */
+            list_remove(&current_task->node);
+            list_insert_tail(rl, &current_task->node);
+
+            /* 被旋转到队尾的任务获得新的完整时间片 */
+            current_task->time_slice_ticks = g_time_slice_ticks;
+
+            /* 新的头部任务即为 next */
+            next = list_entry(rl->sentinel.next, tcb_t, node);
+        }
+    }
+    /* ================================================================ */
 
     /* idle 任务始终就绪，next 不可能为 NULL */
     if (next == NULL || next == current_task) {
@@ -318,6 +362,9 @@ void kernel_init(void)
     port_init_task_context(&idle_task_tcb, idle_task_func);
     task_add_to_ready(&idle_task_tcb);
 
+    /* 空闲任务不参与时间片轮转 */
+    idle_task_tcb.time_slice_ticks = 0;
+
     printf("[kernel] Idle task created (priority=%u)\n", IDLE_PRIORITY);
     printf("[kernel] Kernel initialized.\n");
 }
@@ -381,4 +428,23 @@ uint32_t kernel_get_max_tasks(void)
 uint32_t task_get_count(void)
 {
     return g_task_count;
+}
+
+/* ====================================================================
+ *  时间片配置 API (运行时可变)
+ *
+ *  设计要点:
+ *    - 仅对同优先级任务生效
+ *    - 0 = 禁用时间片轮转 (回退到合作式调度)
+ *    - 新值仅影响新就绪的任务; 已在运行的任务保留原有时间片
+ * ==================================================================== */
+
+void kernel_set_time_slice(uint32_t ticks)
+{
+    g_time_slice_ticks = ticks;
+}
+
+uint32_t kernel_get_time_slice(void)
+{
+    return g_time_slice_ticks;
 }

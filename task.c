@@ -56,7 +56,8 @@ tcb_t *task_create(void (*task_func)(void),
     task->base_priority = priority;
     task->state         = TASK_READY;
     task->stack_size    = stack_size;
-    task->delay_ticks   = 0;
+    task->delay_ticks      = 0;
+    task->time_slice_ticks = g_time_slice_ticks;  /* 初始时间片 */
     strncpy(task->name, name, sizeof(task->name) - 1);
     task->name[sizeof(task->name) - 1] = '\0';
 
@@ -90,6 +91,7 @@ void task_add_to_ready(tcb_t *task)
 {
     if (task == NULL) return;
     task->state = TASK_READY;
+    task->time_slice_ticks = g_time_slice_ticks;  /* 获得新的完整时间片 */
     list_insert_tail(&ready_lists[task->priority], &task->node);
 }
 

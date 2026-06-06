@@ -21,11 +21,12 @@
 11. [Phase 9：可变 Tick 间隔 + 毫秒级延时](#11-phase-9可变-tick-间隔--毫秒级延时)
 12. [Phase 10：任务数量上限控制](#12-phase-10任务数量上限控制)
 13. [Phase 11：计数信号量 (Counting Semaphore)](#13-phase-11计数信号量-counting-semaphore)
-14. [与 FreeRTOS 的对比](#14-与-freertos-的对比)
-15. [扩展方向](#15-扩展方向)
-16. [附录 A：编译与运行](#附录-a编译与运行)
-17. [附录 B：关键文件阅读顺序](#附录-b关键文件阅读顺序)
-18. [附录 C：常见面试/理解问题](#附录-c常见面试理解问题)
+14. [Phase 12：同优先级时间片轮转 (Round-Robin)](#14-phase-12同优先级时间片轮转-round-robin)
+15. [与 FreeRTOS 的对比](#15-与-freertos-的对比)
+16. [扩展方向](#16-扩展方向)
+17. [附录 A：编译与运行](#附录-a编译与运行)
+18. [附录 B：关键文件阅读顺序](#附录-b关键文件阅读顺序)
+19. [附录 C：常见面试/理解问题](#附录-c常见面试理解问题)
 
 ---
 
@@ -146,6 +147,7 @@ ready_lists[0..7]          delayed_list              sem->wait_list
 | 完整执行追踪 | §10 | 15 分钟 |
 | 任务数量限制 | Phase 10 (§12) | 10 分钟 |
 | 信号量 (任务同步) | Phase 11 (§13) | 25 分钟 |
+| 时间片轮转 (同优先级) | Phase 12 (§14) | 20 分钟 |
 
 ---
 
@@ -2920,7 +2922,327 @@ tick 11:[Motor] ★ COMMAND: speed=80, steer=-0.3, PWM=(L:80, R:80)
 
 ---
 
-## 14. 与 FreeRTOS 的对比
+## 14. Phase 12：同优先级时间片轮转 (Round-Robin)
+
+### 推荐先读这些文件
+
+- [kernel.h](kernel.h) — `TIME_SLICE_DEFAULT_TICKS` 常量、TCB 的 `time_slice_ticks` 字段、API 声明
+- [kernel.c](kernel.c) — `process_tick()` 时间片递减、`schedule_select_and_switch()` 轮转逻辑、getter/setter
+- [task.c](task.c) — `task_create()` 初始化时间片、`task_add_to_ready()` 重置时间片
+- [demo_round_robin.c](demo_round_robin.c) — 三阶段验证 demo
+
+### 14.1 问题：同优先级任务互相"饿死"
+
+在 Phase 11 之前，内核采用**固定优先级抢占式调度**。当多个任务具有相同优先级时：
+
+- 排在就绪链表头部的任务先运行
+- 该任务只要不主动调用 `task_yield()`、`task_delay()` 或 `sem_take()`，就会一直占用 CPU
+- 同优先级的其他任务**永远得不到执行** — 这就是"饥饿"
+
+例如，两个同优先级的 CPU 密集型任务：
+
+```c
+/* Task A (prio=3): 纯计算，永不 yield */
+void task_a(void) {
+    while (1) {
+        compute_hash();  // CPU 密集型
+    }
+}
+
+/* Task B (prio=3): 永远等不到 CPU */
+void task_b(void) {
+    while (1) {
+        send_heartbeat();  // 永远不会被执行!
+    }
+}
+```
+
+Task A 不调用任何阻塞 API，Task B 在同优先级就绪队列中永远排在 A 后面，完全没有机会运行。
+
+**FreeRTOS 方案**：同优先级任务按时间片 (time slice) 轮转 — 每个任务执行一个时间片后，内核自动把它移到队列尾部，让下一个同优先级任务执行。
+
+### 14.2 设计思路
+
+核心洞察：**运行中的任务仍然保留在它的就绪链表中（位于头部）**。时间片轮转只需要：
+
+1. 在每个系统 tick 中递减当前任务的时间片
+2. 当时间片耗尽时，将当前任务从链表头部旋转到尾部
+3. 调度器选取新头部任务执行
+
+```
+旋转前:                             旋转后:
+ready_lists[3]:                     ready_lists[3]:
+┌──────────────────────┐            ┌──────────────────────┐
+│ sentinel → A → B → C │            │ sentinel → B → C → A │
+└──────────────────────┘            └──────────────────────┘
+     ↑ 当前运行                       ↑ 下一个运行
+  (time_slice=0)                  (time_slice=10)
+```
+
+### 14.3 TCB 变更
+
+在 [kernel.h](kernel.h) 的 TCB 结构中新增一个字段：
+
+```c
+typedef struct tcb {
+    /* ... 上下文信息、任务属性 ... */
+
+    /* 延时信息 */
+    uint32_t            delay_ticks;       /* 延时还需等待的 tick 数 */
+
+    /* 时间片信息 */
+    uint32_t            time_slice_ticks;  /* 剩余时间片 tick 数 (0 = 不参与轮转) */
+
+    /* 链表节点 */
+    list_node_t         node;
+} tcb_t;
+```
+
+每个任务拥有自己独立的时间片计数器。`time_slice_ticks == 0` 表示该任务不参与时间片轮转（用于空闲任务，或者当全局配置 `g_time_slice_ticks = 0` 禁用轮转时）。
+
+### 14.4 全局配置常量
+
+```c
+#define TIME_SLICE_DEFAULT_TICKS  10   /* 默认时间片: 10 ticks */
+
+extern uint32_t  g_time_slice_ticks;    /* 运行时时间片配置 (可通过 API 修改) */
+```
+
+默认值 10 tick。若 tick 间隔为 10ms，则每个时间片为 100ms。
+
+### 14.5 核心实现：`process_tick()` 中的时间片递减
+
+在 [kernel.c](kernel.c) 的 `process_tick()` 函数中，每个系统节拍到来时递减当前任务的时间片：
+
+```c
+static void process_tick(void)
+{
+    tick_count++;
+
+    /* 时间片递减: 每个 tick 消耗当前任务 1 个时间片
+     * 空闲任务不参与, 时间片已为 0 则不再递减 (防止下溢) */
+    if (current_task != &idle_task_tcb && current_task->time_slice_ticks > 0) {
+        current_task->time_slice_ticks--;
+    }
+
+    /* ... 遍历延时链表、唤醒到期任务 ... */
+}
+```
+
+**设计要点**：
+- `current_task != &idle_task_tcb`：空闲任务永远不消耗时间片。即使所有用户任务都阻塞，idle 也不会因为"时间片用完"而被旋转（idle 是唯一的优先级 7 任务，旋转它没有意义）。
+- `> 0` 守卫：防止下溢。当 `time_slice_ticks` 已经为 0 时（例如全局禁用轮转），不再递减。
+
+### 14.6 核心实现：`schedule_select_and_switch()` 中的轮转逻辑
+
+在调度器选取下一个任务后、决定是否切换前，插入轮转判断：
+
+```c
+static void schedule_select_and_switch(void)
+{
+    tcb_t *next = find_highest_priority_task();
+
+    /* ================================================================
+     *  时间片轮转调度 (Round-Robin)
+     *
+     *  触发条件 (四个条件同时满足):
+     *    1. next == current_task — 没有更高优先级任务就绪
+     *    2. current_task != idle   — 空闲任务不参与轮转
+     *    3. time_slice_ticks == 0 — 时间片已耗尽
+     *    4. g_time_slice_ticks > 0 — 全局轮转使能
+     *
+     *  轮转动作:
+     *    a) 检查同优先级是否还有其他就绪任务
+     *       (链表头节点的 next 不是 sentinel → 至少 2 个节点)
+     *    b) 将 current_task 从头部移到尾部 (rotate)
+     *    c) 给被旋转的任务一个新的完整时间片
+     *    d) 选取新的链表头部任务作为 next
+     * ================================================================ */
+    if (next == current_task &&
+        current_task != &idle_task_tcb &&
+        current_task->time_slice_ticks == 0 &&
+        g_time_slice_ticks > 0) {
+
+        list_t *rl = &ready_lists[current_task->priority];
+
+        /* 确认该优先级上至少还有一个其他任务 */
+        if (rl->sentinel.next->next != &rl->sentinel) {
+            /* 旋转: 从头部移除, 插入尾部 */
+            list_remove(&current_task->node);
+            list_insert_tail(rl, &current_task->node);
+
+            /* 被旋转到队尾的任务获得新的完整时间片 */
+            current_task->time_slice_ticks = g_time_slice_ticks;
+
+            /* 新的头部任务即为 next */
+            next = list_entry(rl->sentinel.next, tcb_t, node);
+        }
+    }
+    /* ================================================================ */
+
+    /* idle 任务始终就绪，next 不可能为 NULL */
+    if (next == NULL || next == current_task) {
+        return;
+    }
+
+    /* ... 上下文切换 ... */
+}
+```
+
+**关键设计决策**：
+
+**为什么在 `schedule_select_and_switch()` 中做轮转，而不是在 `process_tick()` 中？**
+
+`process_tick()` 的职责是处理"时间流逝"（递增 tick、递减延时、唤醒到期任务），不涉及调度决策。时间片轮转是调度决策，应该放在调度器中。这样职责分离清晰，且当 `g_time_slice_ticks = 0` 时，整个轮转逻辑被一个条件跳过，零开销。
+
+**为什么判断 `rl->sentinel.next->next != &rl->sentinel`？**
+
+当前运行的任务位于链表的头部。如果头部节点的 `next` 就是 sentinel，说明链表只有一个节点 — 该优先级只有当前任务自己。此时轮转没有意义（没有其他任务可以切换），跳过旋转，让任务继续运行。这避免了"只有自己还把自己移到队尾再选自己"的空转。
+
+**为什么旋转后显式设置 `time_slice_ticks = g_time_slice_ticks` 而不是调用 `task_add_to_ready()`？**
+
+`task_add_to_ready()` 会做两件事：`task->state = TASK_READY` 和 `list_insert_tail`。但当前任务已经在就绪链表中，且状态可能是 `TASK_RUNNING`。走 `task_add_to_ready` 的路径不合适。旋转操作直接操作链表 + 重置时间片即可。
+
+### 14.7 时间片的获取与重置
+
+时间片在**所有"任务变为就绪"的路径上**统一重置。这个统一入口就是 `task_add_to_ready()`：
+
+```c
+void task_add_to_ready(tcb_t *task)
+{
+    if (task == NULL) return;
+    task->state = TASK_READY;
+    task->time_slice_ticks = g_time_slice_ticks;  /* 获得新的完整时间片 */
+    list_insert_tail(&ready_lists[task->priority], &task->node);
+}
+```
+
+所有就绪路径都经过这里：
+
+| 路径 | 调用链 | 时间片行为 |
+|------|--------|-----------|
+| **任务创建** | `task_create()` → `task_add_to_ready()` | 获得完整时间片 |
+| **延时到期** | `process_tick()` → `task_add_to_ready()` | 获得完整时间片 |
+| **信号量获取** | `sem_give()` → `task_add_to_ready()` | 获得完整时间片 |
+| **主动 yield** | `task_yield()` → `task_add_to_ready()` | 获得完整时间片 |
+| **时间片轮转** | `schedule_select_and_switch()` 内显式赋值 | 获得完整时间片 |
+
+### 14.8 空闲任务的特殊处理
+
+空闲任务需要从时间片机制中完全排除，在 `kernel_init()` 中：
+
+```c
+void kernel_init(void)
+{
+    /* ... 创建 idle_task ... */
+    port_init_task_context(&idle_task_tcb, idle_task_func);
+    task_add_to_ready(&idle_task_tcb);
+
+    /* 空闲任务不参与时间片轮转 */
+    idle_task_tcb.time_slice_ticks = 0;
+
+    /* ... */
+}
+```
+
+必须在 `task_add_to_ready()` **之后**设置，因为 `task_add_to_ready` 会将其重置为 `g_time_slice_ticks`。设为 0 后：
+- `process_tick()` 的 `> 0` 守卫跳过递减
+- `schedule_select_and_switch()` 的 `!= &idle_task_tcb` 守卫跳过轮转
+
+### 14.9 被高优先级抢占：保留剩余时间片
+
+当一个任务被更高优先级任务抢占时，它**不经过 `task_add_to_ready()`**（任务保持在就绪链表中），因此剩余时间片被保留：
+
+```
+时间线:
+  tick 0-5:  Task A (prio=3) 运行, time_slice_ticks: 10 → 5
+  tick 6:    Task B (prio=0) 从延时中唤醒, 抢占 Task A
+             Task A 还在 ready_lists[3] 头部, time_slice_ticks 仍然是 5
+  tick 6-15: Task B 运行, task_delay → schedule()
+  tick 15:   find_highest_priority_task() 找到 Task A (prio 3)
+             next != current_task (Task B), 轮转块跳过
+             Task A 恢复运行, time_slice_ticks = 5 ← 剩余时间片保留!
+  tick 20:   Task A 的 time_slice_ticks 耗尽 (5→0), 触发轮转
+```
+
+这确保了高优先级任务"打断"不会惩罚低优先级任务 — Task A 只消耗了实际占用的 CPU 时间。
+
+### 14.10 禁用时间片轮转
+
+运行时调用 `kernel_set_time_slice(0)` 即可禁用：
+
+```c
+kernel_set_time_slice(0);  // 禁用轮转, 回退到合作式调度
+```
+
+设置 `g_time_slice_ticks = 0` 后：
+- 新就绪的任务获得 `time_slice_ticks = 0`
+- `process_tick()` 中 `> 0` 守卫阻止递减
+- `schedule_select_and_switch()` 中 `g_time_slice_ticks > 0` 条件阻止轮转块
+
+同优先级任务回退到合作式行为 — 只有主动调用 `task_yield()` 或阻塞 API 才会切换。
+
+### 14.11 运行时 API
+
+```c
+void     kernel_set_time_slice(uint32_t ticks);  /* 设置时间片 (0 = 禁用) */
+uint32_t kernel_get_time_slice(void);             /* 获取当前时间片配置 */
+```
+
+遵循与 `kernel_set_max_tasks()` / `kernel_get_max_tasks()` 相同的设计模式。新值只影响新就绪的任务；已在运行的任务保留其当前时间片。
+
+### 14.12 完整轮转示例
+
+以两个同优先级任务 A、B（prio=3），10ms tick 间隔，3 tick 时间片为例：
+
+```
+tick 0:   schedule → Task A 开始运行 (time_slice=3)
+tick 1-2: Task A 运行 (time_slice: 3→2→1)
+tick 3:   process_tick(): A.time_slice 1→0
+          schedule_select_and_switch():
+            next = A (头节点)
+            next==current && time_slice==0 && 有其他任务B
+            → 旋转: A 移到队尾, B 成为头节点
+            → A.time_slice=3, next=B
+          [switch] A → B
+tick 4-5: Task B 运行 (time_slice: 3→2→1)
+tick 6:   process_tick(): B.time_slice 1→0
+          schedule_select_and_switch():
+            next=B, time_slice==0, 有其他任务A
+            → 旋转: B 移到队尾, A 成为头节点
+            → B.time_slice=3, next=A
+          [switch] B → A
+tick 7-9: Task A 继续运行...
+```
+
+两个任务自动交替执行，每个获得 3 个 tick 的 CPU 时间，无需任何 `task_yield()` 调用。
+
+### 14.13 与既有功能的交互总结
+
+| 场景 | 时间片行为 |
+|------|-----------|
+| **高优先级抢占** | `find_highest_priority_task()` 先找到更高优先级 → 轮转块跳过 → 被抢占任务保留剩余时间片 |
+| **task_yield()** | → `task_add_to_ready()` → 获得完整新时间片 → 移到队尾 |
+| **task_delay() 后唤醒** | → `process_tick()` → `task_add_to_ready()` → 获得完整新时间片 |
+| **sem_take() 后唤醒** | → `sem_give()` → `task_add_to_ready()` → 获得完整新时间片 |
+| **g_time_slice_ticks=0** | 所有 task→time_slice_ticks=0 → `process_tick()` 跳过递减 → 轮转块跳过 |
+| **同优先级仅自己** | 时间片耗尽但 `next->next == sentinel` → 无其他任务 → 跳过旋转继续运行 |
+
+### 14.14 学习检查点
+
+1. **为什么空闲任务不参与时间片轮转？** 空闲任务是最低优先级 (7)，且是唯一该优先级的任务。对它做轮转毫无意义 — 没有其他任务可以切过去。
+
+2. **为什么被高优先级抢占后要保留剩余时间片？** 如果重置时间片，高优先级任务频繁抢占会导致低优先级任务"永远用不完一个时间片" — 每次刚被调度就被抢占，时间片重置，永远在被"打断"的状态。保留剩余时间片保证了公平性：一个任务只消耗它实际占用的 CPU 时间。
+
+3. **`task_add_to_ready()` 重置时间片会破坏被抢占任务的剩余时间片吗？** 不会。被抢占的任务直接从"运行中"切换到"运行中" — 它不经过 `task_add_to_ready()`。只有阻塞后重新就绪、yield 后重新就绪、或新创建时才走 `task_add_to_ready()`。
+
+4. **为什么轮转逻辑不放在 `process_tick()` 里？** 职责分离。`process_tick()` 处理"时间流逝"，不涉及调度决策。把轮转放在调度器中，代码更清晰，且当全局禁用轮转时整个逻辑被一个条件跳过。
+
+5. **设置 `kernel_set_time_slice(0)` 后，已经在运行的任务会怎样？** 它们保留当前的 `time_slice_ticks` 值。当递减到 0 后，`> 0` 守卫阻止进一步递减，`g_time_slice_ticks > 0` 条件阻止轮转。系统平滑过渡到合作式调度。
+
+---
+
+## 15. 与 FreeRTOS 的对比
 
 | 概念 | Lite RTOS | FreeRTOS |
 |------|-----------|----------|
@@ -2941,7 +3263,7 @@ tick 11:[Motor] ★ COMMAND: speed=80, steer=-0.3, PWM=(L:80, R:80)
 | Tick 间隔可配 | ✅ `kernel_set_tick_interval_ms()` | ❌ 仅编译期 `configTICK_RATE_HZ` |
 | `task_delay_ms()` | ✅ | ✅ `vTaskDelay(pdMS_TO_TICKS(ms))` |
 | 优先级位图 | ❌ (遍历 8 个优先级) | ✅ `uxTopReadyPriority` (O(1)) |
-| 时间片轮转 | ❌ | ✅ (同优先级按时间片) |
+| 时间片轮转 | ✅ `kernel_set_time_slice()` (Phase 12) | ✅ (同优先级按时间片) |
 | 互斥量 | ❌ | ✅ |
 | 计数信号量 | ✅ `sem_t` (Phase 11) | ✅ |
 | 消息队列 | ❌ | ✅ |
@@ -2949,9 +3271,9 @@ tick 11:[Motor] ★ COMMAND: speed=80, steer=-0.3, PWM=(L:80, R:80)
 
 ---
 
-## 15. 扩展方向
+## 16. 扩展方向
 
-### 15.1 优先级位图加速
+### 16.1 优先级位图加速
 
 当前 `find_highest_priority_task()` 每次扫描 8 个优先级。用位图只需一条 `__builtin_clz()` 指令：
 
@@ -2972,20 +3294,18 @@ static tcb_t *find_highest_priority_task(void) {
 }
 ```
 
-### 15.2 时间片轮转
+### 16.2 时间片轮转 ✅ 已实现
 
-同优先级任务各执行 1 个 tick，然后自动切换到同优先级的下一个：
+时间片轮转已作为 **Phase 12** 正式实现（详见 [§14](#14-phase-12同优先级时间片轮转-round-robin)），支持：
 
-```c
-// 在 process_tick() 中：
-if (当前任务优先级有其他就绪任务 && 时间片用完) {
-    task_remove_from_ready(current_task);
-    task_add_to_ready(current_task);  // 移到链表尾部
-    schedule();  // 触发同优先级切换
-}
-```
+- 可配置的时间片长度（`kernel_set_time_slice(ticks)`）
+- 运行时禁用（`kernel_set_time_slice(0)` 回退到合作式调度）
+- 高优先级抢占不受影响
+- 被抢占任务保留剩余时间片
 
-### 15.3 消息队列 (Message Queue)
+验证 demo：`make DEMO=demo_round_robin && ./build/lite_rtos_demo`
+
+### 16.3 消息队列 (Message Queue)
 
 信号量已作为 Phase 11 正式实现（见 §13），此处预留给下一阶段的消息队列：
 
@@ -3001,7 +3321,7 @@ typedef struct {
 } mqueue_t;
 ```
 
-### 15.4 ARM Cortex-M3 移植
+### 16.4 ARM Cortex-M3 移植
 
 替换 `port.c` 中的 ucontext 操作为：
 
@@ -3022,7 +3342,7 @@ PendSV_Handler:
     bx      lr                     /* 返回，硬件自动恢复 R0-R3,R12,LR,PC,xPSR */
 ```
 
-### 15.5 调试增强
+### 16.5 调试增强
 
 ```c
 // 打印所有任务状态 (调试神器)
