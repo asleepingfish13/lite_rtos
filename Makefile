@@ -22,6 +22,8 @@
 #   demo_car          - 综合: 智能小车巡线 + 多传感器 + 拍照
 #   demo_tick_rate    - Phase 9: 可变 tick 率 (环境监测 vs 小车巡线)
 #   demo_sem          - Phase 11: 计数信号量 (Counting Semaphore) + 小车传感器场景
+#   demo_perf        - 性能检测与实时性验证
+#   demo_round_robin  - Phase 12: 同优先级时间片轮转 (Round-Robin)
 
 # -------------------------------------------------------------------
 # 平台自动检测
@@ -69,7 +71,7 @@ BUILD_DIR = build
 TARGET    = $(BUILD_DIR)/lite_rtos_demo$(EXE_EXT)
 
 # 选择 Demo 文件
-DEMO ?= demo_yield
+DEMO ?= demo_round_robin
 
 # demo_list 只需要链表模块，不需要内核
 ifeq ($(DEMO),demo_list)
@@ -81,6 +83,7 @@ else
     SRCS += task.c
     SRCS += port.c
     SRCS += sem.c
+    SRCS += perf.c
     SRCS += $(DEMO).c
 endif
 
@@ -139,5 +142,7 @@ list-demos:
 	@echo "  make DEMO=demo_car         - 综合: 小车巡线 + 多传感器 + 拍照"
 	@echo "  make DEMO=demo_tick_rate   - Phase 9: 可变 tick 率 (环境监测 vs 小车巡线)"
 	@echo "  make DEMO=demo_sem         - Phase 11: 计数信号量 + 小车传感器 (4 任务)"
+	@echo "  make DEMO=demo_perf        - 性能检测与实时性验证"
+	@echo "  make DEMO=demo_round_robin - Phase 12: 同优先级时间片轮转 (Round-Robin)"
 	@echo ""
 	@echo "  示例: make run DEMO=demo_car"

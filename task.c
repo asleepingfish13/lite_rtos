@@ -80,6 +80,8 @@ tcb_t *task_create(void (*task_func)(void),
 
     g_task_count++;  /* 原子: 仅在主线程调用, 调度器启动前 */
 
+    perf_hook_task_create(task);
+
     return task;
 }
 

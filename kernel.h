@@ -137,5 +137,6 @@ void     kernel_set_time_slice(uint32_t ticks);
 uint32_t kernel_get_time_slice(void);
 
 #include "sem.h"
+#include "perf.h"
 
 #endif /* KERNEL_H */

@@ -70,17 +70,42 @@ static void process_tick(void)
 
     /* 时间片递减: 每个 tick 消耗当前任务 1 个时间片
      * 空闲任务不参与, 时间片已为 0 则不再递减 */
-    if (current_task != &idle_task_tcb && current_task->time_slice_ticks > 0) {
-        current_task->time_slice_ticks--;
-    }
+    {
+        uint32_t old_slice = 0;
+        if (current_task != &idle_task_tcb) {
+            old_slice = current_task->time_slice_ticks;
+            if (current_task->time_slice_ticks > 0) {
+                current_task->time_slice_ticks--;
+            }
+        }
 
-    /* 每个 tick 打印被中断的任务 (调试用)
-     * 注意: 此时调度尚未发生, 显示的是 tick 中断时正在运行的任务。
-     * process_tick() 从信号处理函数调用, printf 仅用于 demo 调试。 */
-    printf("[tick %-4u]  running: %-10s  (prio=%u)\n",
-           tick_count,
-           current_task ? current_task->name : "none",
-           current_task ? current_task->priority : 0);
+        /* 以时间片为单位输出 (不再每个 tick 都打印)
+         * - 轮转模式: 仅在时间片 1→0 耗尽瞬间打印
+         * - 禁用轮转: 每 10 tick 打印一次心跳 (跳过 idle)
+         *   [switch] 行由 schedule_select_and_switch() 独立输出 */
+        {
+            uint8_t do_print = 0;
+            if (g_time_slice_ticks > 0) {
+                /* 时间片轮转启用: 只在 1→0 转换瞬间打印 */
+                if (old_slice == 1 && current_task->time_slice_ticks == 0) {
+                    do_print = 1;
+                }
+            } else {
+                /* 时间片禁用: 每 10 tick 打印一次心跳 (跳过 idle) */
+                if (tick_count % 10 == 0 &&
+                    current_task != &idle_task_tcb) {
+                    do_print = 1;
+                }
+            }
+            if (do_print) {
+                printf("[tick %-4u]  running: %-10s  (prio=%u, slice=%u)\n",
+                       tick_count,
+                       current_task ? current_task->name : "none",
+                       current_task ? current_task->priority : 0,
+                       current_task ? current_task->time_slice_ticks : 0);
+            }
+        }
+    }
 
     /* 遍历延时链表 (使用 _safe 版本，因为可能修改链表) */
     list_for_each_safe(node, tmp, &delayed_list) {
@@ -90,6 +115,7 @@ static void process_tick(void)
 
         if (task->delay_ticks == 0) {
             /* 延时到期，唤醒任务 */
+            perf_hook_task_wake(task);
             list_remove(node);
             task_add_to_ready(task);
         }
@@ -131,38 +157,48 @@ static void schedule_select_and_switch(void)
     tcb_t *next = find_highest_priority_task();
 
     /* ================================================================
-     *  时间片轮转调度 (Round-Robin)
+     *  时间片轮转调度 (Round-Robin) — 两种触发场景:
      *
-     *  当最高优先级就绪任务就是 current_task 自身，
-     *  且其时间片已耗尽 (time_slice_ticks == 0)，
-     *  且该优先级上还有其他就绪任务时:
-     *    1. 将 current_task 从链表头部移到尾部 (rotate)
-     *    2. 给被旋转的任务一个新的完整时间片
-     *    3. 选取新的链表头部任务作为 next
+     *  场景 A: next == current_task (同任务)
+     *    当前任务时间片用完，且同优先级有其他就绪任务
+     *    → 旋转 current_task 到队尾，选队头运行
      *
-     *  空闲任务不参与轮转 (它永远不应该"用完"时间片)。
-     *  当 g_time_slice_ticks == 0 时全局禁用轮转。
+     *  场景 B: next != current_task (切到其他任务)
+     *    被切换到的任务时间片已耗尽 (例如刚从抢占中恢复)
+     *    → 旋转 next 到队尾，选队头运行 (避免 slice=0 空跑)
+     *
+     *  空闲任务不参与轮转。g_time_slice_ticks == 0 时全局禁用。
      * ================================================================ */
-    if (next == current_task &&
-        current_task != &idle_task_tcb &&
-        current_task->time_slice_ticks == 0 &&
-        g_time_slice_ticks > 0) {
+    if (g_time_slice_ticks > 0) {
 
-        list_t *rl = &ready_lists[current_task->priority];
+        /* ---- 场景 A: next == current ---- */
+        if (next == current_task &&
+            current_task != &idle_task_tcb &&
+            current_task->time_slice_ticks == 0) {
 
-        /* 确认该优先级上至少还有一个其他任务
-         * (即链表头节点的 next 不是 sentinel)。
-         * 如果只有 current_task 自己, 没必要轮转。 */
-        if (rl->sentinel.next->next != &rl->sentinel) {
-            /* 旋转: 从头部移除, 插入尾部 */
-            list_remove(&current_task->node);
-            list_insert_tail(rl, &current_task->node);
+            list_t *rl = &ready_lists[current_task->priority];
+            if (rl->sentinel.next->next != &rl->sentinel) {
+                list_remove(&current_task->node);
+                list_insert_tail(rl, &current_task->node);
+                current_task->time_slice_ticks = g_time_slice_ticks;
+                next = list_entry(rl->sentinel.next, tcb_t, node);
+            }
+        }
 
-            /* 被旋转到队尾的任务获得新的完整时间片 */
-            current_task->time_slice_ticks = g_time_slice_ticks;
+        /* ---- 场景 B: next != current, 但 next 时间片已耗完 ---- */
+        if (next != current_task &&
+            next != &idle_task_tcb &&
+            next->time_slice_ticks == 0) {
 
-            /* 新的头部任务即为 next */
-            next = list_entry(rl->sentinel.next, tcb_t, node);
+            list_t *rl = &ready_lists[next->priority];
+            /* 检查 next 所处优先级是否有其他就绪任务 */
+            if (rl->sentinel.next->next != &rl->sentinel) {
+                /* next 就是链表头部, 旋转它到队尾 */
+                list_remove(&next->node);
+                list_insert_tail(rl, &next->node);
+                next->time_slice_ticks = g_time_slice_ticks;
+                next = list_entry(rl->sentinel.next, tcb_t, node);
+            }
         }
     }
     /* ================================================================ */
@@ -174,11 +210,21 @@ static void schedule_select_and_switch(void)
 
     tcb_t *prev = current_task;
 
+    /* 抢占检测: 在修改状态之前检查
+     *   如果 prev 当前是 TASK_RUNNING (非自愿离开 CPU)，
+     *   且 next 优先级更高 → 发生了抢占 */
+    uint8_t prev_was_running = (prev->state == TASK_RUNNING);
+
     if (prev->state == TASK_RUNNING) {
         prev->state = TASK_READY;
     }
     next->state = TASK_RUNNING;
     current_task = next;
+
+    if (prev_was_running && next->priority < prev->priority
+        && prev != &idle_task_tcb) {
+        perf_hook_preempt(prev, next);
+    }
 
     /* 上下文切换追踪: 打印谁 → 谁 (调试用) */
     printf("[switch]  tick=%-4u  %-10s (prio=%u)  →  %-10s (prio=%u)\n",
@@ -209,7 +255,9 @@ static void schedule_select_and_switch(void)
 #endif
 #endif
 
+    perf_hook_switch_start(prev, next);
     port_switch_context(prev, next);
+    perf_hook_switch_end();
 
     /* 当 prev 再次被调度时，从此处继续执行。
      * sp_snap / fp_snap 等局部变量随栈/寄存器一起被 swapcontext 恢复，
@@ -367,6 +415,9 @@ void kernel_init(void)
 
     printf("[kernel] Idle task created (priority=%u)\n", IDLE_PRIORITY);
     printf("[kernel] Kernel initialized.\n");
+
+    /* 初始化性能监控 */
+    perf_init();
 }
 
 void kernel_start(void)

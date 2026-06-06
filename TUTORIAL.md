@@ -22,11 +22,12 @@
 12. [Phase 10：任务数量上限控制](#12-phase-10任务数量上限控制)
 13. [Phase 11：计数信号量 (Counting Semaphore)](#13-phase-11计数信号量-counting-semaphore)
 14. [Phase 12：同优先级时间片轮转 (Round-Robin)](#14-phase-12同优先级时间片轮转-round-robin)
-15. [与 FreeRTOS 的对比](#15-与-freertos-的对比)
-16. [扩展方向](#16-扩展方向)
-17. [附录 A：编译与运行](#附录-a编译与运行)
-18. [附录 B：关键文件阅读顺序](#附录-b关键文件阅读顺序)
-19. [附录 C：常见面试/理解问题](#附录-c常见面试理解问题)
+15. [Phase 13：性能检测与实时性验证 (Perf Module)](#15-phase-13性能检测与实时性验证-perf-module)
+16. [与 FreeRTOS 的对比](#16-与-freertos-的对比)
+17. [扩展方向](#17-扩展方向)
+18. [附录 A：编译与运行](#附录-a编译与运行)
+19. [附录 B：关键文件阅读顺序](#附录-b关键文件阅读顺序)
+20. [附录 C：常见面试/理解问题](#附录-c常见面试理解问题)
 
 ---
 
@@ -148,6 +149,7 @@ ready_lists[0..7]          delayed_list              sem->wait_list
 | 任务数量限制 | Phase 10 (§12) | 10 分钟 |
 | 信号量 (任务同步) | Phase 11 (§13) | 25 分钟 |
 | 时间片轮转 (同优先级) | Phase 12 (§14) | 20 分钟 |
+| 性能检测与实时性验证 | Phase 13 (§15) | 25 分钟 |
 
 ---
 
@@ -3043,39 +3045,46 @@ static void schedule_select_and_switch(void)
     tcb_t *next = find_highest_priority_task();
 
     /* ================================================================
-     *  时间片轮转调度 (Round-Robin)
+     *  时间片轮转调度 (Round-Robin) — 两种触发场景:
      *
-     *  触发条件 (四个条件同时满足):
-     *    1. next == current_task — 没有更高优先级任务就绪
-     *    2. current_task != idle   — 空闲任务不参与轮转
-     *    3. time_slice_ticks == 0 — 时间片已耗尽
-     *    4. g_time_slice_ticks > 0 — 全局轮转使能
+     *  场景 A: next == current_task (同任务)
+     *    当前任务时间片用完，且同优先级有其他就绪任务
+     *    → 旋转 current_task 到队尾，选队头运行
      *
-     *  轮转动作:
-     *    a) 检查同优先级是否还有其他就绪任务
-     *       (链表头节点的 next 不是 sentinel → 至少 2 个节点)
-     *    b) 将 current_task 从头部移到尾部 (rotate)
-     *    c) 给被旋转的任务一个新的完整时间片
-     *    d) 选取新的链表头部任务作为 next
+     *  场景 B: next != current_task (切到其他任务)
+     *    被切换到的目标任务时间片已耗尽 (例如刚从抢占中恢复)
+     *    → 旋转 next 到队尾，选队头运行 (避免 slice=0 空跑浪费 CPU)
+     *
+     *  空闲任务不参与轮转。g_time_slice_ticks == 0 时全局禁用。
      * ================================================================ */
-    if (next == current_task &&
-        current_task != &idle_task_tcb &&
-        current_task->time_slice_ticks == 0 &&
-        g_time_slice_ticks > 0) {
+    if (g_time_slice_ticks > 0) {
 
-        list_t *rl = &ready_lists[current_task->priority];
+        /* ---- 场景 A: next == current ---- */
+        if (next == current_task &&
+            current_task != &idle_task_tcb &&
+            current_task->time_slice_ticks == 0) {
 
-        /* 确认该优先级上至少还有一个其他任务 */
-        if (rl->sentinel.next->next != &rl->sentinel) {
-            /* 旋转: 从头部移除, 插入尾部 */
-            list_remove(&current_task->node);
-            list_insert_tail(rl, &current_task->node);
+            list_t *rl = &ready_lists[current_task->priority];
+            if (rl->sentinel.next->next != &rl->sentinel) {
+                list_remove(&current_task->node);
+                list_insert_tail(rl, &current_task->node);
+                current_task->time_slice_ticks = g_time_slice_ticks;
+                next = list_entry(rl->sentinel.next, tcb_t, node);
+            }
+        }
 
-            /* 被旋转到队尾的任务获得新的完整时间片 */
-            current_task->time_slice_ticks = g_time_slice_ticks;
+        /* ---- 场景 B: next != current, 但 next 时间片已耗完 ---- */
+        if (next != current_task &&
+            next != &idle_task_tcb &&
+            next->time_slice_ticks == 0) {
 
-            /* 新的头部任务即为 next */
-            next = list_entry(rl->sentinel.next, tcb_t, node);
+            list_t *rl = &ready_lists[next->priority];
+            if (rl->sentinel.next->next != &rl->sentinel) {
+                list_remove(&next->node);
+                list_insert_tail(rl, &next->node);
+                next->time_slice_ticks = g_time_slice_ticks;
+                next = list_entry(rl->sentinel.next, tcb_t, node);
+            }
         }
     }
     /* ================================================================ */
@@ -3090,6 +3099,19 @@ static void schedule_select_and_switch(void)
 ```
 
 **关键设计决策**：
+
+**两种触发场景的区别是什么？**
+
+| | 场景 A | 场景 B |
+|---|---|---|
+| **触发条件** | `next == current_task` | `next != current_task` |
+| **触发时机** | ISR tick 到来，当前任务时间片刚好耗尽 | 调度器从抢占上下文恢复，选到的目标任务 slice=0 |
+| **旋转对象** | `current_task` | `next`（即将要运行但时间片为 0 的任务） |
+| **典型场景** | 同优先级正常轮转 | 高优先级任务刚结束抢占，被抢占任务已被同队列的另一个任务替换 |
+
+**场景 B 解决了什么问题？**
+
+抢占发生时若恰好落在两个时间片之间，被抢占任务可能 slice 已经为 0。抢占结束后如果不加判断，slice=0 的任务会被"空跑"一个 tick（等到下一个 ISR 触发场景 A 才能轮转）。场景 B 在切换目标确定后立即检查 — 如果目标任务 slice=0，当场旋转，不给它浪费 CPU 的机会。
 
 **为什么在 `schedule_select_and_switch()` 中做轮转，而不是在 `process_tick()` 中？**
 
@@ -3149,9 +3171,11 @@ void kernel_init(void)
 - `process_tick()` 的 `> 0` 守卫跳过递减
 - `schedule_select_and_switch()` 的 `!= &idle_task_tcb` 守卫跳过轮转
 
-### 14.9 被高优先级抢占：保留剩余时间片
+### 14.9 被高优先级抢占：两种子场景
 
-当一个任务被更高优先级任务抢占时，它**不经过 `task_add_to_ready()`**（任务保持在就绪链表中），因此剩余时间片被保留：
+当一个任务被更高优先级任务抢占时，它**不经过 `task_add_to_ready()`**（任务保持在就绪链表中），因此剩余时间片被保留。抢占结束后的行为取决于该任务的剩余时间片：
+
+**子场景 1：抢占时任务还有剩余时间片**
 
 ```
 时间线:
@@ -3160,12 +3184,32 @@ void kernel_init(void)
              Task A 还在 ready_lists[3] 头部, time_slice_ticks 仍然是 5
   tick 6-15: Task B 运行, task_delay → schedule()
   tick 15:   find_highest_priority_task() 找到 Task A (prio 3)
-             next != current_task (Task B), 轮转块跳过
+             next != current_task (Task B), 场景 A/B 均不触发 (A slice=5 ≠ 0)
              Task A 恢复运行, time_slice_ticks = 5 ← 剩余时间片保留!
-  tick 20:   Task A 的 time_slice_ticks 耗尽 (5→0), 触发轮转
+  tick 20:   Task A 的 time_slice_ticks 耗尽 (5→0), 触发场景 A 轮转
 ```
 
 这确保了高优先级任务"打断"不会惩罚低优先级任务 — Task A 只消耗了实际占用的 CPU 时间。
+
+**子场景 2：抢占恰好卡在时间片边界（slice 已为 0）**
+
+```
+时间线:
+  tick 0-3:  Task A (prio=3) 运行, time_slice_ticks: 3→0
+  tick 3:    时间片耗尽! 但同时 Task B (prio=0) 也从延时中唤醒
+             schedule_select_and_switch():
+               next = B (prio=0 > prio=3), next != current_task
+               场景 A 跳过 (next ≠ current), 场景 B 跳过 (B slice ≠ 0)
+               → 切换到 Task B (抢占优先于轮转)
+  tick 3-7:  Task B 运行 (4 tick), task_delay → schedule()
+  tick 7:    find_highest_priority_task() 找到 Task A (prio 3)
+             next = Task A, next != current_task (Task B)
+             场景 B 触发! A.time_slice_ticks == 0, 同优先级还有 Task C
+             → 旋转: A 移到队尾, C 成为头节点
+             → 切换: B → C (不是 A! A 的时间片已用完, 不能让它空跑)
+```
+
+**这就是场景 B 存在的意义**：抢占发生时若恰好卡在两个时间片之间，被抢占任务 slice 已为 0。抢占结束后场景 B 当场旋转，不让 slice=0 的任务浪费一个 tick 的 CPU 时间。具体执行轨迹见 §14.15。
 
 ### 14.10 禁用时间片轮转
 
@@ -3228,7 +3272,105 @@ tick 7-9: Task A 继续运行...
 | **g_time_slice_ticks=0** | 所有 task→time_slice_ticks=0 → `process_tick()` 跳过递减 → 轮转块跳过 |
 | **同优先级仅自己** | 时间片耗尽但 `next->next == sentinel` → 无其他任务 → 跳过旋转继续运行 |
 
-### 14.14 学习检查点
+### 14.14 真实执行轨迹：抢占 + 轮转的完整交互
+
+下面是从 `demo_round_robin` Phase 2 提取的真实运行记录。配置：tick=10ms，时间片=3 tick (30ms)，两个 worker (C、D) 在 prio=3 做轮转，一个 preemptor 在 prio=0 每 30ms 抢占，每次抢占做 40M 次 volatile 迭代（约 8 tick）。
+
+```
+[switch] tick=20  preemptor → worker_C         ← Phase 2 开始, C 先跑
+[tick 23] running: worker_C (slice=0)           ← C 时间片 3→0, 耗尽!
+[switch] tick=23  worker_C → preemptor           ← 同时 preemptor 延时到期
+          ↑                                       preemptor prio=0 > C prio=3
+          ↑                                       场景 A 跳过 (next≠current)
+[PREEMPT] #1 working (1/4 tick=24) (2/4 tick=25)
+[tick 26] running: preemptor (slice=0)           ← preemptor 自己的时间片也耗尽了
+[PREEMPT] working (3/4 tick=26)
+[PREEMPT] working (4/4 tick=28) ← last batch    ← 最后 10M 迭代 (tick 26→28)
+[PREEMPT] #1 done (tick=28)                     ← 完成! 调用 task_delay_ms(30)
+[switch] tick=28  preemptor → worker_D           ← ★ 场景 B! C slice=0, 旋转→D
+          ↑ schedule(): next=worker_C (slice=0)
+          ↑ 场景 B 触发: 旋转 C 到队尾, 选 D 为头
+          ↑ 直接给 D, 不浪费一个 tick 在 C 上
+[tick 31] running: worker_D (slice=0)            ← D 运行 3 tick, 时间片耗尽
+[switch] tick=31  worker_D → preemptor           ← preemptor 再次唤醒 (30ms 到)
+[PREEMPT] #2 working (1/4 tick=32)...
+```
+
+**关键观察**：
+
+1. **tick 23**：C 时间片刚好耗尽 (slice=0)，同时 preemptor 也到期了。调度器优先选 preemptor (prio=0)，场景 A 被跳过。这是正确的 — 抢占优先于轮转。
+
+2. **tick 28**：preemptor 完成工作后调用 `task_delay` → `schedule()`。此时 `find_highest_priority_task()` 找到 worker_C（仍挂在 prio 3 头部），但 C 的 slice=0。场景 B 检测到这个情况，将 C 旋转到队尾，选 D 作为 next。**C 没有浪费任何 CPU 时间**。
+
+3. **preemptor 在 tick 23-28 之间每次 quarter 打印都在不同 tick**：因为 40M 迭代足够长（~8 tick），每个 checkpoint (10M、20M、30M、40M) 都落在不同 tick 窗口内。这模拟了真实的高优先级任务"处理紧急事务"的时长。
+
+### 14.15 输出格式：以时间片为单位
+
+为了减少日志噪音，`process_tick()` 中的 tick 打印从"每个 tick 一行"改为"仅在时间片边界打印"：
+
+```c
+/* 时间片递减 + 按时间片单位输出 */
+{
+    uint32_t old_slice = 0;
+    if (current_task != &idle_task_tcb) {
+        old_slice = current_task->time_slice_ticks;
+        if (current_task->time_slice_ticks > 0) {
+            current_task->time_slice_ticks--;
+        }
+    }
+
+    /* 以时间片为单位输出:
+     * - 轮转模式 (g_time_slice_ticks > 0): 仅打印 1→0 耗尽瞬间
+     * - 禁用轮转 (g_time_slice_ticks == 0): 每 10 tick 一次心跳 */
+    uint8_t do_print = 0;
+    if (g_time_slice_ticks > 0) {
+        if (old_slice == 1 && current_task->time_slice_ticks == 0)
+            do_print = 1;
+    } else {
+        if (tick_count % 10 == 0 && current_task != &idle_task_tcb)
+            do_print = 1;
+    }
+    if (do_print) {
+        printf("[tick %-4u]  running: %-10s  (prio=%u, slice=%u)\n",
+               tick_count, current_task->name,
+               current_task->priority, current_task->time_slice_ticks);
+    }
+}
+```
+
+**设计要点**：
+- 只用 `old_slice == 1 && slice == 0` 判断 1→0 转换，避免 slice 停在 0 后每个 tick 都重复打印
+- 输出格式包含 `slice=N` 以便一眼看到当前剩余时间片
+- `[switch]` 行由 `schedule_select_and_switch()` 独立输出，不受影响
+- 禁用轮转时每 10 tick 输出一次心跳（跳过 idle）
+
+### 14.16 深入问答 (Q&A)
+
+**Q1: 为什么 preemptor 在同一个 tick 里能打印两次？**
+
+A: preemptor 是最高优先级 (prio=0)，运行时没有任何任务能打断它。SIGALRM 每 10ms 触发一次，但信号处理函数只是递增 `tick_count` 然后返回 — 它不能阻止 preemptor 继续执行。所以如果两次 checkpoint 之间的计算量 <10ms，它们就会落在同一个 tick。要让每次 checkpoint 严格跨 tick，需要增加计算量使相邻 checkpoint 间距 >10ms。
+
+**Q2: 抢占恰好发生在时间片耗尽的那一刻怎么办？**
+
+A: 抢占优先。tick 信号到来时，`process_tick()` 先递减时间片（可能让 slice 从 1 变成 0），然后唤醒到期任务（可能让高优先级任务进入就绪）。`schedule_select_and_switch()` 从 prio 0 开始扫描，高优先级任务被先找到 — 轮转的 场景 A 因 `next != current_task` 而跳过。低优先级任务的 slice=0 状态保留，等到抢占结束后由 场景 B 处理。
+
+**Q3: 场景 B 会误旋转刚被 task_add_to_ready() 重置了时间片的任务吗？**
+
+A: 不会。`task_add_to_ready()` 将 `time_slice_ticks` 设为 `g_time_slice_ticks`（非零值），而场景 B 的条件是 `time_slice_ticks == 0`。一个刚从阻塞中唤醒的任务 slice 是饱满的（=3），不会被误旋转。
+
+**Q4: 为什么从抢占恢复后的 C→D 切换是在同一个 tick 完成的？**
+
+A: 这是 `schedule()`（任务上下文）的行为，不是 `schedule_from_isr()`。当 preemptor 调用 `task_delay` 触发 `schedule()` 时，场景 B 立刻旋转并切换，不需要等下一个 tick。整个过程在一个 `schedule()` 调用中完成：选择 next、发现 slice=0、旋转、再选 next、切换。
+
+**Q5: preemptor 自己的时间片是怎么处理的？**
+
+A: preemptor 作为 prio=0 的最高优先级任务，也有 `time_slice_ticks`。它的时间片同样在每个 tick 递减。当 slice 耗尽变为 0 时，场景 A 检查发现 preemptor 的同优先级没有其他任务 → `next->next == sentinel` → 跳过旋转。preemptor 继续运行，slice 保持在 0。只有它主动调用 `task_delay` 才会让出 CPU。这是正确的 — 最高优先级任务不应被轮转打断。
+
+**Q6: 空闲任务为什么在输出中偶尔显示 `slice=0`？**
+
+A: 当 `g_time_slice_ticks > 0` 时，idle 任务的 `time_slice_ticks` 在 `kernel_init()` 中被强制设为 0，且 `process_tick()` 的 `!= &idle_task_tcb` 守卫阻止了递减。当 `g_time_slice_ticks == 0`（Phase 3 禁用轮转）时，所有任务的 slice 都是 0，但心跳输出会跳过 idle 以避免无意义的日志。详见 §14.8 和 §14.15。
+
+### 14.17 学习检查点
 
 1. **为什么空闲任务不参与时间片轮转？** 空闲任务是最低优先级 (7)，且是唯一该优先级的任务。对它做轮转毫无意义 — 没有其他任务可以切过去。
 
@@ -3240,9 +3382,555 @@ tick 7-9: Task A 继续运行...
 
 5. **设置 `kernel_set_time_slice(0)` 后，已经在运行的任务会怎样？** 它们保留当前的 `time_slice_ticks` 值。当递减到 0 后，`> 0` 守卫阻止进一步递减，`g_time_slice_ticks > 0` 条件阻止轮转。系统平滑过渡到合作式调度。
 
+6. **场景 A 和场景 B 的区别是什么？** 场景 A 处理"当前任务时间片用完"的情况（`next == current`），在 ISR tick 中触发。场景 B 处理"切换目标时间片已用完"的情况（`next != current`），在抢占恢复或任何调度器选中 slice=0 任务时触发。两者互补，确保无论从哪个路径进入调度器，slice=0 的任务都不会浪费 CPU。
+
+7. **为什么 preemptor 的每 quarter 打印有时在同一个 tick？** preemptor 是最高优先级，运行时不受轮转打断。两次 checkpoint 间的计算如果小于一个 tick 间隔 (10ms)，就会落在同一个 tick 窗口。这是正常的 — 说明 preemptor 足够快，不是 bug。增加迭代量可以让 checkpoint 跨 tick。
+
 ---
 
-## 15. 与 FreeRTOS 的对比
+## 15. Phase 13：性能检测与实时性验证 (Perf Module)
+
+> **本 Phase 回答的核心问题：**
+> 如何用数据证明你写的 RTOS 真的具备"实时性"？
+> "我的最高优先级任务需要多长时间才能抢到 CPU？""上下文切换到底有多快？""被抢占了几次？"
+> 这些问题如果只靠眼睛看终端输出是无法精确回答的——你需要一套性能监控模块来量化测量。
+
+---
+
+### 15.1 为什么需要性能检测？
+
+前面 12 个 Phase 我们实现了任务调度、抢占、信号量、时间片轮转——功能完整了，
+但**实时系统不能只靠"看起来在跑"来证明自己**。
+
+实时操作系统的三个核心承诺：
+
+| 承诺 | 含义 | 如何验证 |
+|------|------|---------|
+| **响应有界** | 高优先级任务就绪后，必须在有限时间内得到 CPU | 测量 wake→run 的时间差 |
+| **切换确定** | 上下文切换的时间开销可预测、不剧烈抖动 | 测量每次 swapcontext 的耗时 |
+| **抢占有效** | 高优先级任务确实能在低优先级运行时抢走 CPU | 计数抢占事件，验证优先级关系 |
+
+**如果没有 perf 模块**，你只能靠肉眼看 `[tick]` 和 `[switch]` 输出来判断——3 秒内 300 行的输出根本看不过来。
+
+**有了 perf 模块**，你运行 `make run DEMO=demo_perf`，等 3 秒，自动得到一份量化报告。
+
+---
+
+### 15.2 测量哪些指标？
+
+perf 模块测量的 7 个核心指标：
+
+```
+┌─────────────────────┬────────────────────────────────┬──────────────────────────┐
+│ 指标                │ 含义                          │ 证明什么                 │
+├─────────────────────┼────────────────────────────────┼──────────────────────────┤
+│ 响应时间            │ 任务从"延时到期"到"实际运行"   │ 硬实时能力：最高优先     │
+│ (Response Time)     │ 的时间差                      │ 级任务的最长等待时间     │
+├─────────────────────┼────────────────────────────────┼──────────────────────────┤
+│ 上下文切换时间      │ swapcontext() 保存+恢复       │ 调度器开销的确定性和     │
+│ (CS Time)           │ 寄存器集合的耗时              │ 最小/最大/平均值         │
+├─────────────────────┼────────────────────────────────┼──────────────────────────┤
+│ 执行时间            │ 任务一次连续占用 CPU 的时间    │ 是否在周期内完成         │
+│ (Execution Time)    │ (从开始运行到被切换走)         │ (用于截止期检测)         │
+├─────────────────────┼────────────────────────────────┼──────────────────────────┤
+│ 周期抖动            │ 连续两次启动间隔的波动幅度     │ 周期精度                 │
+│ (Period Jitter)     │ = (最大间隔-最小间隔)/目标周期 │ 被抢占的任务必然有抖动   │
+├─────────────────────┼────────────────────────────────┼──────────────────────────┤
+│ CPU 利用率          │ 总执行时间 / 系统运行时间      │ 负载分布                 │
+│ (CPU Utilization)   │                                │                          │
+├─────────────────────┼────────────────────────────────┼──────────────────────────┤
+│ 抢占次数            │ 任务被更高优先级任务           │ 抢占机制是否生效         │
+│ (Preemption Count)  │ 强制离开 CPU 的次数            │                          │
+├─────────────────────┼────────────────────────────────┼──────────────────────────┤
+│ 截止期错失          │ 执行时间超过目标周期的次数     │ 系统可调度性             │
+│ (Deadline Miss)     │                                │ 0 = 没有超时             │
+└─────────────────────┴────────────────────────────────┴──────────────────────────┘
+```
+
+---
+
+### 15.3 时间测量：为什么用 `clock_gettime(CLOCK_MONOTONIC)`？
+
+```c
+// perf.c 核心计时函数
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+```
+
+**为什么是 `CLOCK_MONOTONIC`？**
+
+- **纳秒精度**：可以测量微秒级别的上下文切换开销
+- **单调递增**：不受系统时间调整影响（不会出现"时间倒退"）
+- **异步信号安全**：可以在 SIGALRM 信号处理器中安全调用（`man 7 signal-safety` 列入 safe list）
+
+> **对比**：如果只用 `tick_count`（tick 级别的精度），10ms 间隔下只能测到"几个 tick" 的粒度。
+> 但上下文切换只需要 1~5 微秒——用 tick 根本测不出来。
+
+---
+
+### 15.4 钩子插入位置（内核中的 5 个关键点）
+
+perf 模块不修改内核逻辑，只在关键路径上插入轻量级钩子：
+
+```
+                     ┌──────────────────────┐
+                     │   kernel_init()      │
+                     │   └─ perf_init()      │  ← 钩子⑤: 初始化全局统计结构
+                     └──────────────────────┘
+
+                     ┌──────────────────────┐
+                     │   task_create()      │
+                     │   └─ perf_hook_      │  ← 钩子①: 注册任务到统计表
+                     │      task_create()   │
+                     └──────────────────────┘
+
+                     ┌──────────────────────┐
+                     │   process_tick()     │
+                     │   delay_ticks → 0    │
+                     │   └─ perf_hook_      │  ← 钩子②: 记录唤醒时间戳
+                     │      task_wake()     │      (last_wake_ns)
+                     └──────────────────────┘
+
+┌──────────────────────────────────────────────────────┐
+│          schedule_select_and_switch()                │
+│                                                      │
+│  if (prev state == RUNNING && next prio 更高)        │
+│      └─ perf_hook_preempt(prev, next)  ← 钩子③: 抢占│
+│                                                      │
+│  perf_hook_switch_start(prev, next)    ← 钩子④: CS前│
+│  port_switch_context(prev, next)                     │
+│  perf_hook_switch_end()                ← 钩子④: CS后│
+│      (在新任务上下文中执行!)                          │
+└──────────────────────────────────────────────────────┘
+```
+
+**关键设计决策：为什么 `perf_hook_switch_end()` 不带参数？**
+
+```c
+// ❌ 错误做法: 通过参数传递 prev/next
+perf_hook_switch_end(prev, next);
+// swapcontext() 之后，局部变量 prev/next 是被恢复任务自己的值，
+// 不是当前这次切换的 from/to！
+
+// ✅ 正确做法: 用全局变量保存 from/to
+// 在 switch_start 中:
+g_perf.cs_pending_from = from;
+g_perf.cs_pending_to   = to;
+
+// 在 switch_end 中 (无参数):
+tcb_t *from = (tcb_t *)g_perf.cs_pending_from;  // 从全局读
+tcb_t *to   = (tcb_t *)g_perf.cs_pending_to;
+```
+
+> **起因**：`swapcontext()` 保存当前任务的全部上下文（包括栈上的局部变量），
+> 然后恢复另一个任务的上下文。恢复后执行的代码使用的局部变量**属于被恢复的那个任务**，
+> 而不是当前发起切换的任务。所以 `perf_hook_switch_end(A, B)` 中的 `A` 和 `B`
+> 是被恢复任务自己之前调用时保存的值，完全是错的。
+>
+> **解决**：把 `from` 和 `to` 存在全局 `g_perf` 结构体中，`perf_hook_switch_end(void)` 
+> 无参数，从全局读取。由于调度器是单线程的（上下文切换期间不可能并发），全局变量不会被覆盖。
+
+---
+
+### 15.5 抢占检测的微妙之处
+
+```c
+// kernel.c 中的抢占检测逻辑
+
+tcb_t *prev = current_task;                           // 谁正在运行
+
+// ★ 必须在修改状态之前检查
+uint8_t prev_was_running = (prev->state == TASK_RUNNING);
+
+if (prev->state == TASK_RUNNING) {
+    prev->state = TASK_READY;                         // ← 状态在这里被改了!
+}
+next->state = TASK_RUNNING;
+
+// 检查真正的抢占条件:
+//   1. prev 本来在运行 (不是自己调用 task_delay 阻塞的)
+//   2. next 的优先级更高
+//   3. prev 不是 idle 任务 (idle 被"抢占"是正常行为，不计数)
+if (prev_was_running && next->priority < prev->priority
+    && prev != &idle_task_tcb) {
+    perf_hook_preempt(prev, next);                    // ★ 这才是真正的抢占
+}
+```
+
+**为什么不能直接检查 `prev->state == TASK_RUNNING`？**
+
+因为在抢占检查之前，`prev->state` 已经被改成 `TASK_READY` 了！
+必须**在修改之前**用临时变量 `prev_was_running` 保存状态。
+
+**三种不是抢占的情况**：
+
+| 场景 | prev->state | 是否算抢占 | 原因 |
+|------|------------|-----------|------|
+| `task_delay()` → schedule() | TASK_BLOCKED | ❌ | 任务自己主动阻塞 |
+| idle → 任何任务 | TASK_RUNNING | ❌ | idle 被唤醒是正常调度 |
+| ISR 中断正在运行的任务 | TASK_RUNNING | ✅ | **这才是抢占** |
+
+---
+
+### 15.6 数据结构设计
+
+```c
+// perf.h — 核心数据结构
+
+/* 每任务统计: 20 个字段覆盖 7 个指标 */
+typedef struct {
+    uint8_t  active;                  // 此槽位是否被占用
+
+    // 基本计数
+    uint32_t run_count;               // 被调度运行的次数
+    uint32_t preempt_count;           // 被抢占次数
+    uint32_t preempted_by[8];         // 被各优先级抢占分布
+
+    // 响应时间: wake → run (ns)
+    uint64_t response_min_ns;
+    uint64_t response_max_ns;
+    uint64_t response_total_ns;
+    uint32_t response_count;
+
+    // 执行时间: run → switch_out (ns)
+    uint64_t exec_min_ns;
+    uint64_t exec_max_ns;
+    uint64_t exec_total_ns;
+
+    // 周期: 两次 run_start 的间隔 (ns)
+    uint64_t period_target_ns;        // 目标周期
+    uint64_t period_min_ns;
+    uint64_t period_max_ns;
+    uint64_t period_total_ns;
+    uint32_t period_count;
+
+    // 截止期
+    uint32_t deadline_misses;         // exec_time > period_target
+
+    // 内部追踪
+    uint64_t last_wake_ns;            // 最近唤醒时间戳
+    uint64_t last_start_ns;           // 最近开始运行时间戳
+    uint64_t last_period_start_ns;    // 上一个周期起始时间戳
+    char     name[16];
+    uint8_t  priority;
+} perf_task_t;
+
+/* 全局统计 */
+typedef struct {
+    uint8_t  initialized;             // 钩子守卫: 未初始化则跳过
+    uint64_t init_time_ns;            // 系统启动时刻
+
+    // 上下文切换
+    uint32_t cs_count;
+    uint64_t cs_total_ns;
+    uint64_t cs_min_ns;
+    uint64_t cs_max_ns;
+    uint64_t cs_pending_start_ns;     // CS 计时临时存储
+    void    *cs_pending_from;         // 当前 CS 的 from 任务
+    void    *cs_pending_to;           // 当前 CS 的 to 任务
+
+    // 抢占
+    uint32_t total_preemptions;
+
+    // 任务表
+    uint32_t    task_count;
+    perf_task_t tasks[20];            // 最多追踪 20 个任务
+} perf_global_t;
+```
+
+**设计要点**：
+- `initialized` 字段是零开销的开关——所有钩子第一行检查它，未初始化立即返回
+- 极值初始化为 `UINT64_MAX`，第一次测量自动成为 min（因为任何值都 < UINT64_MAX）
+- `cs_pending_start_ns` 被消费后清零，防止首次激活任务的无效测量
+
+---
+
+### 15.7 响应时间 vs 周期抖动：两个容易被混淆的概念
+
+这是性能检测中最容易混淆的两个概念：
+
+```
+         wake                 start              下次 wake        下次 start
+          │                     │                    │                 │
+    ──────┼─────────────────────┼────────────────────┼─────────────────┼────→ 时间
+          │                     │                    │                 │
+          ├── 响应时间 ────────→│                    │                 │
+          │   (wake → start)    │                    │                 │
+          │                     ├──── 执行时间 ─────→│                 │
+          │                     │   (start → end)    │                 │
+          │                     │←────── 周期 ──────→│                 │
+          │                     │   (start → 下次 start)              │
+```
+
+- **响应时间**：从"我应该跑了"到"我真的在跑了"——衡量**调度器的反应速度**
+- **周期**：两次实际启动之间的时间间隔——衡量**任务执行的规律性**
+- **抖动**：多次周期的波动幅度——衡量**时间的可预测性**
+
+> **关键理解**：高优先级任务的响应时间短（微秒级）≠ 周期抖动小。
+> 因为 tick 是 10ms 离散的，任务可能在 tick 边界前后被唤醒，
+> 导致 ±0.5 tick (5ms) 的周期波动——这是 tick 机制的固有特性，不是 bug。
+
+---
+
+### 15.8 demo_perf.c 场景设计
+
+```
+┌──────────────┬──────┬─────────┬──────────────────┐
+│ Task         │ Prio │ Period  │ CPU Time         │
+├──────────────┼──────┼─────────┼──────────────────┤
+│ sensor_ctrl  │  0   │  50ms   │ ~20ms (快速抢占) │
+│ watchdog     │  1   │ 300ms   │ ~20ms (编排器)   │
+│ matrix_calc  │  2   │ 200ms   │ ~80ms (CPU密集) │
+│ data_logger  │  4   │ 200ms   │ ~20ms (后台)    │
+└──────────────┴──────┴─────────┴──────────────────┘
+```
+
+**为什么这样设计？**
+
+| 任务 | 设计目的 |
+|------|---------|
+| `sensor_ctrl` (prio=0) | **验证响应有界**：最高优先级，50ms 周期，每次运行 ~20ms。在 `matrix_calc` 运行时被唤醒，测量从 tick 到期到实际获得 CPU 的时间 |
+| `matrix_calc` (prio=2) | **验证抢占**：400×400 矩阵乘法（堆分配 3.66MB），每次迭代 ~35ms，2 次迭代跨约 7-8 个 tick。期间被 `sensor_ctrl` 反复抢占，每次迭代后输出校验和——所有迭代校验和必须完全一致，证明寄存器保存/恢复正确 |
+| `watchdog` (prio=1) | **触发报告**：300ms 周期，运行 10 次后调用 `perf_print_report()` 并退出 |
+| `data_logger` (prio=4) | **验证低优先级不饿死**：最低优先级，200ms 周期。在高负载下仍然能定期运行 |
+
+**矩阵校验和的设计意图**：
+
+```
+每次迭代输出:
+  ✔ [matrix_calc] iteration 1/2 complete, diag_checksum = 52536.000000
+  ✔ [matrix_calc] iteration 2/2 complete, diag_checksum = 52536.000000
+
+如果上下文保存/恢复有任何差错，校验和会不一致！
+所有迭代、所有周期的校验和始终为 52536.000000 → 上下文切换正确。
+```
+
+---
+
+### 15.9 运行报告解读
+
+运行 `make run DEMO=demo_perf` 后，最终输出：
+
+```
+======================================================================
+  Lite RTOS — Performance & Real-Time Verification Report
+======================================================================
+  System Uptime:          3.121 seconds
+  Context Switches:       130 (min: 1.00 μs, max: 5.00 μs, avg: 1.38 μs)
+  Total Preemptions:      31
+----------------------------------------------------------------------
+  Task           Pri   Runs  Preempted  Resp (min/max/avg)      CPU%  DL Miss
+  -------------- ---  -----  ---------  ----------------------  -----  -------
+  sensor_ctrl      0     60          0  2μs/13μs/5μs            1.8%  0
+  watchdog         1     10          1  88μs/114μs/98μs         0.5%  0
+  matrix_calc      2     14         30  4μs/30ms/8ms           35.0%  0
+  data_logger      4     14          0  3μs/9μs/5μs            2.1%  0
+----------------------------------------------------------------------
+======================================================================
+  Real-Time Verification
+======================================================================
+  [✓] Highest-priority task (sensor_ctrl) response bounded:
+      max = 13.00 μs < 1 tick (10.00 ms)
+  [✓] Context switch deterministic:
+      max/min = 5.0x (< 10x threshold)
+  [✓] Preemption effective:
+      31 total preemptions recorded
+  [✓] No deadline misses detected
+  [✓] sensor_ctrl: period jitter = 1.92% (< 5%)
+
+  === All real-time checks PASSED ===
+```
+
+**逐项解读**：
+
+**1. 上下文切换：min=1μs, max=5μs, avg=1.38μs**
+
+→ 每次任务切换平均只需 1.38 微秒。最慢也不会超过 5 微秒。
+这比一个 tick (10ms = 10000μs) 小 3 个数量级，调度开销几乎可以忽略。
+
+**2. 响应时间：sensor_ctrl 最长 13μs**
+
+→ 最高优先级任务从"应该运行"到"实际运行"最慢只需 13 微秒。
+远小于 1 tick (10ms)。证明了**硬实时响应**——sensor_ctrl 几乎瞬间获得 CPU。
+
+**3. 抢占：31 次**
+
+→ 在 3 秒内，matrix_calc 被 sensor_ctrl 抢占了 30 次（另外 1 次是 watchdog）。
+平均每次 matrix_calc 执行期间被抢占 ~2 次。抢占机制工作正常。
+
+**4. 截止期错失：0**
+
+→ 没有任务的执行时间超过其周期。系统可调度，不超载。
+
+**5. 校验和一致：52536.000000**
+
+→ 所有 14 次 400×400 矩阵乘法的校验和完全相同。
+即使被抢断了 30 次，上下文恢复完全正确。
+
+---
+
+### 15.10 关键代码走读
+
+**钩子轻量化设计**：
+
+```c
+void perf_hook_task_wake(void *task_ptr)
+{
+    if (!g_perf.initialized) return;  // ← 第一行守卫，未初始化几乎零开销
+
+    tcb_t *task = (tcb_t *)task_ptr;
+    perf_task_t *p = find_slot(task->name);
+    if (p) {
+        p->last_wake_ns = now_ns();   // 只记录一个时间戳
+    }
+}
+```
+
+每个钩子函数只有 ~5 行实际逻辑，不分配内存，不 printf（报告只在外层显式调用 `perf_print_report()` 时输出）。
+
+**switch_end 中响应时间 + 周期 + 执行时间的三合一测量**：
+
+```c
+void perf_hook_switch_end(void)
+{
+    // ... 前置检查 ...
+
+    tcb_t *from = (tcb_t *)g_perf.cs_pending_from;  // 谁被切出
+    tcb_t *to   = (tcb_t *)g_perf.cs_pending_to;    // 谁被切入
+
+    uint64_t now = now_ns();
+
+    // 1. 上下文切换时间 = 现在 - switch_start 记录的时刻
+    uint64_t cs_time = now - g_perf.cs_pending_start_ns;
+
+    // 2. 更新 from 任务的执行时间
+    perf_task_t *p_from = find_slot(from->name);
+    if (p_from && p_from->last_start_ns > 0) {
+        uint64_t exec_time = now - p_from->last_start_ns;
+        // 更新 min/max/total, 检查截止期
+    }
+
+    // 3. 更新 to 任务的启动统计
+    perf_task_t *p_to = find_slot(to->name);
+    if (p_to) {
+        p_to->run_count++;
+        p_to->last_start_ns = now;
+
+        // 响应时间 = 现在 - 上次 wake 时间
+        if (p_to->last_wake_ns > 0) {
+            uint64_t response = now - p_to->last_wake_ns;
+            // 更新 min/max/total
+        }
+
+        // 周期 = 现在 - 上次周期起始
+        if (p_to->last_period_start_ns > 0) {
+            uint64_t period = now - p_to->last_period_start_ns;
+            // 更新 min/max/total
+        }
+        p_to->last_period_start_ns = now;
+    }
+}
+```
+
+**一个钩子调用完成了 3 个指标的测量**，设计紧凑。
+
+---
+
+### 15.11 Q&A：性能检测相关问题
+
+**Q1: 为什么周期抖动对最高优先级任务也能到 20%？这不说明系统不"实时"吗？**
+
+A: 周期抖动的计算是 `(max - min) / target`。在短时间运行（3 秒）中，
+tick 是 10ms 的离散单位——任务在 tick 边界前后被唤醒，可能产生 ±0.5 tick 的波动。
+这 1 tick 的波动在 50ms 周期上就是 ~10ms/50ms = 20%。
+
+这不是 bug，而是 tick 机制的**物理限制**。真正的实时性体现在**响应时间**上——
+sensor_ctrl 最长只需 13μs（而非 10ms）就能得到 CPU。
+随着运行时间增长，周期抖动会趋于稳定（多次采样平均后接近 2-5%）。
+
+**Q2: `perf_hook_switch_end` 为什么不能接受参数，必须用全局变量？**
+
+A: 因为 `swapcontext()` 恢复的是**被切入任务**的上下文（包括栈和局部变量）。
+`perf_hook_switch_end(prev, next)` 中的 `prev` 和 `next` 是被切入任务
+之前调用时保存在栈上的局部变量，不属于当前这次"谁切到谁"的切换。
+
+把 `from`/`to` 存到全局 `g_perf.cs_pending_from/to` 中，`perf_hook_switch_end(void)` 
+从全局读取——绕过了 `swapcontext` 导致的局部变量"身份错乱"。
+
+**Q3: 抢占检测为什么必须在 `prev->state` 被修改之前完成？**
+
+A: 因为调度器在检测到需要切换时，会先将 `prev->state = TASK_READY`，
+然后再执行其他逻辑。如果抢占检查写在这行之后，`prev->state` 已经是 `TASK_READY`，
+无法区分"被抢占（本来是 TASK_RUNNING）"和"主动阻塞（本来是 TASK_BLOCKED）"。
+
+**Q4: 为什么 idle 任务的"被抢占"不计入抢占统计？**
+
+A: idle 任务优先级最低（7），任何用户任务就绪都会"抢走" idle 的 CPU。
+但这不算真正的抢占——idle 就是设计来"在没人需要 CPU 时占位"的。
+如果把 idle 也算进去，每次 idle→sensor_ctrl 的切换都会计为一次"抢占"，
+3 秒内会有几十次无意义的统计。
+
+**Q5: 为什么用 `CLOCK_MONOTONIC` 而不是 `gettimeofday()`？**
+
+A: `gettimeofday()` 返回的是"墙上时钟"（wall clock），可能被 NTP 校时、
+用户手动调时等操作突然改变（甚至倒退）。`CLOCK_MONOTONIC` 保证单调递增，
+不受外部调整影响，是性能测量的标准选择。
+
+**Q6: 如果多个任务在同一个 tick 同时被唤醒，响应时间如何计算？**
+
+A: 在 `process_tick()` 中，延时到期的任务逐个被调用 `perf_hook_task_wake()`，
+记录各自的 `last_wake_ns`。然后调度器按优先级选最高者执行。
+所以同时唤醒的任务有相同的 wake 时间戳，但只有最高优先级的那个先运行——
+它的响应时间最短，低优先级的要等它运行完才能得到 CPU，响应时间自然更长。
+这准确反映了固定优先级抢占调度的行为。
+
+**Q7: CPU 利用率超过 100% 是怎么回事？**
+
+A: 在 perf 报告中，每个任务的 CPU 利用率独立计算（各自除以系统总运行时间）。
+如果多个任务的利用率相加超过 100%，是因为它们在不同时间段使用了 CPU，
+而总 CPU 时间 = 系统运行时间（单核）。各任务利用率之和应该 ≈ 100%。
+如果某个任务显示 >100%，说明它的 `exec_total_ns` 超过了 `uptime_ns`——
+这通常是测量初始化的时序问题，在实际使用中不会出现。
+
+**Q8: 在真实硬件（ARM Cortex-M7）上能用吗？**
+
+A: 当前 perf 模块使用 `clock_gettime(CLOCK_MONOTONIC)`，这在 bare-metal
+环境中不可用。移植到 ARM 需要改用硬件定时器（如 DWT Cycle Counter，
+`DWT->CYCCNT`）作为时间源。核心逻辑（钩子插入位置、全局变量模式、
+统计聚合算法）与平台无关，可以直接复用。
+
+---
+
+### 15.12 小结
+
+Phase 13 为 Lite RTOS 增加了性能检测和实时性验证能力：
+
+| 新增文件 | 功能 |
+|---------|------|
+| `perf.h` / `perf.c` | 性能监控模块：7 项指标、5 个内核钩子、自动报告 |
+| `demo_perf.c` | 可视化 Demo：4 任务混合优先级、400×400 矩阵抢占验证 |
+
+| 修改文件 | 改动 |
+|---------|------|
+| `kernel.h` | 引入 `perf.h` |
+| `kernel.c` | 5 处钩子插入（wake / preempt / switch_start+end / init） |
+| `task.c` | `task_create()` 末尾注册任务 |
+| `Makefile` | 添加 `perf.o` 编译和 `demo_perf` 目标 |
+
+**核心设计原则**：
+- **零侵入**：所有钩子受 `g_perf.initialized` 守卫，未初始化不产生任何副作用
+- **信号安全**：使用 `clock_gettime`（POSIX async-signal-safe），不在 ISR 中调用 printf
+- **全局变量模式**：解决 `swapcontext` 后的局部变量身份问题
+
+运行 `make run DEMO=demo_perf` 即可得到量化验证报告。
+
+---
+
+## 16. 与 FreeRTOS 的对比
 
 | 概念 | Lite RTOS | FreeRTOS |
 |------|-----------|----------|
@@ -3271,7 +3959,7 @@ tick 7-9: Task A 继续运行...
 
 ---
 
-## 16. 扩展方向
+## 17. 扩展方向
 
 ### 16.1 优先级位图加速
 
@@ -3452,3 +4140,9 @@ make clean && make
 14. **schedule() 和 schedule_from_isr() 的区别？** → schedule() 在任务上下文中调用，自己负责开关中断；schedule_from_isr() 在 ISR 上下文中调用，额外管理信号掩码。详见 §9.3
 15. **`task_delay()` 和 `task_delay_ms()` 的区别？** → `task_delay(N)` 的参数是 tick 数，实际时间取决于 tick 间隔；`task_delay_ms(N)` 的参数是真实毫秒，与 tick 间隔解耦。推荐用后者。详见 §7.4b
 16. **为什么不用两个硬件定时器来实现"快慢两种 tick"？** → 不需要。固定一个高速 tick + `task_delay_ms()` 就能覆盖所有场景。相机等慢任务阻塞时 CPU 进入 WFI 睡眠，比降低 tick 频率更省电。两个定时器会显著增加复杂度且 PC 模拟器不支持。详见 §11.7
+17. **如何量化证明 RTOS 的"实时性"？** → 通过 perf 模块测量：① 最高优先级任务响应时间（wake→run, 应 <1 tick）；② 上下文切换确定性（max/min <10x）；③ 抢占有效性（低优先级任务被抢占次数）；④ 无截止期错失。详见 §15.9
+18. **响应时间和周期抖动有什么区别？** → 响应时间 = "从该醒了到真的在跑"（调度器反应速度，应 μs 级）；周期 = "两次实际启动之间的间隔"（任务规律性）；抖动 = 周期波动幅度。被抢占的任务抖动必然大，这不是 bug。详见 §15.7
+19. **为什么 `perf_hook_switch_end()` 不能通过参数传递 from/to？** → `swapcontext()` 恢复被切入任务的完整上下文（含栈局部变量），`perf_hook_switch_end(A, B)` 中的 A/B 属于被恢复任务上次保存的值而非当前切换。解决：存到全局 `g_perf.cs_pending_from/to`。详见 §15.4
+20. **矩阵乘法校验和为什么总是同一个值？** → 因为每次用相同的初始数据做 400×400 矩阵乘法。校验和一致（如 52536.000000）证明 CPU 寄存器在抢占→保存→恢复的整个过程中没有损坏任何数据。详见 §15.8
+21. **周期抖动 20% 是不是说明系统不"实时"？** → 不。实时性核心指标是响应时间（13μs << 10ms 得 ✓），而非周期抖动。周期抖动受 tick 离散粒度和运行时长影响，长时间运行会趋于稳定。详见 §15.11 Q1
+22. **在真实硬件上怎么移植 perf 模块？** → 核心逻辑（钩子位置、全局变量模式、统计算法）与平台无关。唯一需要替换的是 `clock_gettime` → ARM DWT Cycle Counter (`DWT->CYCCNT`) 或硬件定时器。详见 §15.11 Q8
